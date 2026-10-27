@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{callsign}} hotspot</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #667085; --line: #e3e6eb; --good: #1a7f37; --bad: #b42318; --accent: #2457d6; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111418; --card: #1a1e24; --text: #e8eaed; --muted: #98a2b3; --line: #2b313a; --good: #4cc26a; --bad: #f97066; --accent: #7a9cff; } }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 8px 0 16px; }
+  h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+  .row span:first-child { color: var(--muted); }
+  .good { color: var(--good); } .bad { color: var(--bad); }
+  form { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  select, input, button { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
+  input { width: 3.5em; text-transform: uppercase; text-align: center; }
+  button { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
+  button.plain { background: var(--card); color: var(--text); border-color: var(--line); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>{{callsign}} <small>{{frequency}} MHz, module {{module}}</small></h1>
+
+  <div class="card"><h2>Now</h2><div id="now">Idle</div></div>
+
+  <div class="card">
+    <h2>Reflector</h2>
+    <div class="row"><span>Link</span><span id="link">…</span></div>
+    <form method="post" action="/link">
+      <input name="reflector" list="reflectors" placeholder="Reflector" style="width:9em;text-align:left" required aria-label="Reflector">
+      <datalist id="reflectors">{{reflector_options}}</datalist>
+      <input name="module" maxlength="1" value="A" required aria-label="Module">
+      <button>Link</button>
+    </form>
+    <form method="post" action="/unlink"><button class="plain">Unlink</button></form>
+  </div>
+
+  <div class="card" id="allstar-card" hidden>
+    <h2>AllStar node <span id="allstar-node"></span></h2>
+    <div id="allstar-error" class="bad"></div>
+    <table><tbody id="allstar-links"></tbody></table>
+    <form method="post" action="/allstar/link">
+      <input name="node" placeholder="Node" style="width:6em" required aria-label="Node">
+      <label><input type="checkbox" name="permanent" style="width:auto"> Permanent</label>
+      <label><input type="checkbox" name="monitor" style="width:auto"> Monitor</label>
+      <label><input type="checkbox" name="echolink" style="width:auto"> EchoLink</label>
+      <button>Link</button>
+    </form>
+    <h2 style="margin-top:14px">Schedule</h2>
+    <table><tbody id="allstar-schedule"></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>Services</h2>
+    <div class="row"><span>Modem</span><span id="modem">…</span></div>
+    <div class="row"><span>AllStar vocoder</span><span id="vocoder">…</span></div>
+    <div class="row"><span>APRS-IS</span><span id="aprs">…</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Last heard</h2>
+    <table><thead><tr><th>Time</th><th>Callsign</th><th>Via</th><th>Length</th></tr></thead><tbody id="heard"></tbody></table>
+  </div>
+</main>
+<script>
+  const sources = { rf: "RF", reflector: "Reflector", allstar: "AllStar" };
+  const flag = (value, good, bad) => value === null ? "Off" : value ? `<span class="good">${good}</span>` : `<span class="bad">${bad}</span>`;
+  const text = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+  async function refresh() {
+    try {
+      const status = await (await fetch("/api/status")).json();
+      document.getElementById("now").innerHTML = status.current ? `<b>${text(status.current.callsign)}</b> via ${sources[status.current.source]}, ${status.current.seconds}s` : "Idle";
+      const link = status.link;
+      document.getElementById("link").innerHTML = !link.target ? "Not linked" : link.connected ? `<span class="good">Linked to ${text(link.target)}</span>` : `<span class="bad">Linking ${text(link.target)}…</span>`;
+      document.getElementById("modem").innerHTML = status.modem_connected ? `<span class="good">Connected</span> ${text(status.modem_firmware)}` : '<span class="bad">Not responding</span>';
+      document.getElementById("vocoder").innerHTML = flag(status.vocoder_connected, "Connected", "Not reachable");
+      document.getElementById("aprs").innerHTML = flag(status.aprs_connected, "Connected", "Disconnected");
+      const allstar = status.allstar;
+      document.getElementById("allstar-card").hidden = !allstar;
+      if (allstar) {
+        document.getElementById("allstar-node").textContent = allstar.node;
+        document.getElementById("allstar-error").textContent = allstar.error || "";
+        document.getElementById("allstar-links").innerHTML = allstar.links.length ? allstar.links.map((node) => `<tr><td>${text(node)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(node)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>';
+        document.getElementById("allstar-schedule").innerHTML = allstar.schedule.map((run) => `<tr><td>${text(run.name)}</td><td>${new Date(run.next_at * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</td></tr>`).join("");
+      }
+      document.getElementById("heard").innerHTML = status.heard.map((entry) => `<tr><td>${new Date(entry.started_at * 1000).toLocaleTimeString()}</td><td>${text(entry.callsign)}</td><td>${sources[entry.source]}</td><td>${entry.seconds}s</td></tr>`).join("");
+    } catch (error) { /* keep the last view while the hotspot restarts */ }
+  }
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>

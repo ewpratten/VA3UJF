@@ -1,0 +1,4 @@
+*
+!Cargo.lock
+!subprojects/apps/va3ujf/Cargo.toml
+!subprojects/apps/va3ujf/src

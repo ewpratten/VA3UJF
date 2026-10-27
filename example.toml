@@ -1,0 +1,41 @@
+# Example station configuration, with placeholder values. Run with `va3ujf --config example.toml`
+# startup_reflector = "DCS999 A"
+
+http_listen = "0.0.0.0:8080"
+
+[station]
+callsign = "N0CALL"
+module = "B"
+frequency_mhz = 446.5
+latitude = 45.0
+longitude = -90.0
+
+[modem]
+port = "/dev/ttyS0"
+
+[aprs]
+server = "noam.aprs2.net:14580"
+
+# Pulls DStarGateway's reflector list, caching it for the next start. The reflectors below override it by name
+[hosts]
+
+[[reflector]]
+name = "DCS999"
+protocol = "dcs"
+address = "192.0.2.10"
+
+[allstar]
+node = 12345
+ambeserver = "127.0.0.1:2460"
+message = "AllStar 12345"
+
+# Cron times are in the host's timezone. Unlink specific nodes rather than "all", so a schedule never drops a link made by hand
+[[allstar.schedule]]
+name = "Weekly Net"
+cron = "55 18 * * 2"
+actions = [{ link = "54321", permanent = true }]
+
+[[allstar.schedule]]
+name = "Weekly Net ends"
+cron = "0 20 * * 2"
+actions = [{ unlink = "54321" }]
