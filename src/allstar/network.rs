@@ -62,21 +62,21 @@ pub async fn register(node: u32, iax_port: u16, registration: Registration, shar
             if let Some(status) = snapshot.allstar.as_mut() {
                 status.registered = Some(registered);
             }
+            let link = state::link_mut(snapshot, super::LINK_NAME, super::LINK_KIND);
+            link.warnings = if registered { Vec::new() } else { vec!["The node is not registered with All Star Link.".to_string()] };
         });
         sleep(Duration::from_secs(registration.interval_seconds.max(1))).await;
     }
 }
 
-// Links as AllStarLink lists them, each one mode letter and a node: T for transceive, R for monitor, C while connecting. D-STAR links ride along as T entries
+// Links as AllStarLink lists them, each one mode letter and a node: T for transceive, R for monitor, C while connecting. Links with a single target, like reflectors, ride along as T entries
 fn nodes_field(snapshot: &Snapshot) -> String {
-    let mut nodes: Vec<String> = snapshot
-        .allstar
-        .iter()
-        .flat_map(|status| &status.links)
-        .map(|link| format!("{}{}", if !link.connected { 'C' } else if link.mode == "monitor" { 'R' } else { 'T' }, link.node))
-        .collect();
-    if let Some(target) = snapshot.link.target.as_ref().filter(|_| snapshot.link.connected) {
-        nodes.push(format!("T{}", target.replace(' ', "")));
+    let mut nodes: Vec<String> = Vec::new();
+    for link in &snapshot.links {
+        nodes.extend(link.peers.iter().map(|peer| format!("{}{}", if !peer.connected { 'C' } else if peer.mode == "monitor" { 'R' } else { 'T' }, peer.id)));
+        if let Some(target) = link.target.as_ref().filter(|_| link.connected) {
+            nodes.push(format!("T{}", target.replace(' ', "")));
+        }
     }
     nodes.join(",")
 }
@@ -153,10 +153,10 @@ pub async fn statpost(node: u32, statpost: Statpost, shared: Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AllstarLink, AllstarStatus, LinkStatus};
+    use crate::state::{LinkStatus, PeerStatus};
 
-    fn link(node: &str, mode: &'static str, connected: bool) -> AllstarLink {
-        AllstarLink { node: node.to_string(), mode, outbound: true, connected, keyed: false }
+    fn peer(id: &str, mode: &'static str, connected: bool) -> PeerStatus {
+        PeerStatus { id: id.to_string(), mode, outbound: true, connected, keyed: false }
     }
 
     #[test]
@@ -174,11 +174,9 @@ mod tests {
 
     #[test]
     fn stats_list_links_with_their_modes_and_the_reflector() {
-        let snapshot = Snapshot {
-            allstar: Some(AllstarStatus { links: vec![link("2000", "transceive", true), link("2001", "monitor", true), link("2002", "transceive", false)], ..Default::default() }),
-            link: LinkStatus { target: Some("DCS999 A".to_string()), connected: true },
-            ..Default::default()
-        };
+        let allstar = LinkStatus { peers: vec![peer("2000", "transceive", true), peer("2001", "monitor", true), peer("2002", "transceive", false)], ..LinkStatus::new("allstar", "allstar") };
+        let reflector = LinkStatus { target: Some("DCS999 A".to_string()), connected: true, ..LinkStatus::new("reflector", "reflector") };
+        let snapshot = Snapshot { links: vec![allstar, reflector], ..Default::default() };
         assert_eq!(nodes_field(&snapshot), "T2000,R2001,C2002,TDCS999A");
     }
 }

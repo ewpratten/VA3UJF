@@ -1,14 +1,14 @@
 // Fixtures for tests that run a whole node, with the channels a bridge would hold
 
-use super::{channel, run, Audio, Handle};
+use super::node::run;
+use super::{channel, Handle};
+use crate::codec::{Audio, SAMPLES_PER_FRAME};
 use crate::speech::Speaker;
-use crate::config::{Allstar, Station};
+use crate::config::Allstar;
 use crate::state::{self, Shared};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-
-pub const SAMPLES_PER_FRAME: usize = 160;
 
 pub struct TestNode {
     pub handle: Handle,
@@ -26,14 +26,12 @@ pub fn start_node(node: u32, port: u16, peers: &[(u32, String)]) -> TestNode {
 pub fn start_node_speaking(node: u32, port: u16, peers: &[(u32, String)], speaker: Option<Speaker>) -> TestNode {
     let peer_table: String = peers.iter().map(|(peer, address)| format!("\"{peer}\" = \"{address}\"\n")).collect();
     let allstar: Allstar = toml::from_str(&format!("node = {node}\nambeserver = \"127.0.0.1:2460\"\niax_port = {port}\npark_reflector = false\n[nodes]\n{peer_table}")).unwrap();
-    let station: Station = toml::from_str("callsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0").unwrap();
     let shared = Shared::default();
     state::update(&shared, |snapshot| snapshot.allstar = Some(state::AllstarStatus { node, ..Default::default() }));
     let (handle, commands) = channel();
     let (to_node, from_bridge) = mpsc::channel(256);
     let (to_bridge, from_node) = mpsc::channel(256);
-    let (reflector_commands, _unused) = mpsc::channel(4);
-    tokio::spawn(run(allstar, station, shared.clone(), reflector_commands, speaker, from_bridge, to_bridge, commands));
+    tokio::spawn(run(allstar, shared.clone(), speaker, from_bridge, to_bridge, commands));
     TestNode { handle, shared, to_node, from_node }
 }
 
@@ -47,21 +45,17 @@ pub async fn wait_for(description: &str, mut condition: impl FnMut() -> bool) {
     panic!("timed out waiting for {description}");
 }
 
-pub fn linked(node: &TestNode, peer: &str) -> bool {
-    state::read(&node.shared).allstar.is_some_and(|status| status.links.iter().any(|link| link.node == peer && link.connected))
+pub fn linked(node: &TestNode, peer_id: &str) -> bool {
+    state::read(&node.shared).links.iter().any(|link| link.peers.iter().any(|peer| peer.id == peer_id && peer.connected))
 }
 
 pub fn has_no_links(node: &TestNode) -> bool {
-    state::read(&node.shared).allstar.is_some_and(|status| status.links.is_empty())
-}
-
-pub fn pcm_to_bytes(samples: &[i16]) -> Vec<u8> {
-    samples.iter().flat_map(|sample| sample.to_le_bytes()).collect()
+    state::read(&node.shared).links.iter().all(|link| link.peers.is_empty())
 }
 
 // 20 ms of a tone, so every frame carries something
-pub fn tone_frame(phase: usize) -> Vec<u8> {
-    pcm_to_bytes(&(0..SAMPLES_PER_FRAME).map(|index| (((phase * SAMPLES_PER_FRAME + index) as f32 * 0.2).sin() * 8000.0) as i16).collect::<Vec<_>>())
+pub fn tone_frame(phase: usize) -> Vec<i16> {
+    (0..SAMPLES_PER_FRAME).map(|index| (((phase * SAMPLES_PER_FRAME + index) as f32 * 0.2).sin() * 8000.0) as i16).collect()
 }
 
 // Send a transmission at the pace of real audio, then end it
@@ -79,8 +73,8 @@ pub async fn heard_frames(receiver: &mut mpsc::Receiver<Audio>, patience: Durati
     let deadline = Instant::now() + patience;
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(600), receiver.recv()).await {
-            Ok(Some(Audio::Voice(bytes))) => {
-                assert_eq!(bytes.len(), SAMPLES_PER_FRAME * 2);
+            Ok(Some(Audio::Voice(samples))) => {
+                assert_eq!(samples.len(), SAMPLES_PER_FRAME);
                 frames += 1;
             }
             Ok(Some(Audio::End)) => return Some(frames),
@@ -92,8 +86,8 @@ pub async fn heard_frames(receiver: &mut mpsc::Receiver<Audio>, patience: Durati
 }
 
 // A frame of one steady level, so what comes out of a mix can be checked by its size
-pub fn constant_frame(level: i16) -> Vec<u8> {
-    pcm_to_bytes(&[level; SAMPLES_PER_FRAME])
+pub fn constant_frame(level: i16) -> Vec<i16> {
+    vec![level; SAMPLES_PER_FRAME]
 }
 
 pub async fn transmit_level(sender: &mpsc::Sender<Audio>, level: i16, frames: usize) {
@@ -110,9 +104,8 @@ pub async fn heard_levels(receiver: &mut mpsc::Receiver<Audio>, patience: Durati
     let deadline = Instant::now() + patience;
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(600), receiver.recv()).await {
-            Ok(Some(Audio::Voice(bytes))) => {
-                let samples: Vec<i32> = bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as i32).collect();
-                levels.push(samples.iter().sum::<i32>() / samples.len() as i32);
+            Ok(Some(Audio::Voice(samples))) => {
+                levels.push(samples.iter().map(|sample| *sample as i32).sum::<i32>() / samples.len() as i32);
             }
             Ok(Some(Audio::End)) => break,
             _ if !levels.is_empty() => break,

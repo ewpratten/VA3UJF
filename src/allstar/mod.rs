@@ -10,8 +10,11 @@ mod tokens;
 #[cfg(test)]
 pub mod testing;
 
-use crate::config::{Action, Allstar, ScheduleEntry};
-use crate::state::{self, ScheduledRun, Shared};
+use crate::bridge;
+use crate::config::{Action, Allstar, ScheduleEntry, Station};
+use crate::router::{Router, Scope};
+use crate::speech::Speaker;
+use crate::state::{self, AllstarStatus, ScheduledRun, Shared};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Local};
 use croner::Cron;
@@ -20,13 +23,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-pub use node::run;
-
-// Audio between the node and the bridge: 20 ms of 8 kHz signed 16-bit little-endian samples at a time, then an end marker
-pub enum Audio {
-    Voice(Vec<u8>),
-    End,
-}
+// How the node is named in the status and the transmission log
+pub const LINK_NAME: &str = "allstar";
+pub const LINK_KIND: &str = "allstar";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum LinkMode {
@@ -47,6 +46,38 @@ pub struct Handle {
 pub fn channel() -> (Handle, mpsc::Receiver<Command>) {
     let (commands, receiver) = mpsc::channel(16);
     (Handle { commands }, receiver)
+}
+
+// Attach the node to the router, vocoding between its audio and D-STAR, and start it along with its schedule
+pub fn start(allstar: Allstar, station: Station, shared: Shared, router: &mut Router, speaker: Option<Speaker>) -> Handle {
+    let (bridge_to_node, from_bridge) = mpsc::channel(256);
+    let (node_to_bridge, from_node) = mpsc::channel(256);
+    let (handle, node_commands) = channel();
+    state::update(&shared, |snapshot| snapshot.allstar = Some(AllstarStatus { node: allstar.node, ..Default::default() }));
+
+    let settings = bridge::Settings {
+        name: "allstar",
+        ambeserver: allstar.ambeserver.clone(),
+        suffix: allstar.suffix.clone(),
+        message: allstar.message.clone().unwrap_or_else(|| format!("{} via AllStar", station.callsign)),
+        rx_gain_db: allstar.rx_gain_db,
+        tx_gain_db: allstar.tx_gain_db,
+    };
+    let port = router.attach(LINK_KIND, Scope::Everyone);
+    let (bridge_shared, node_shared, schedule_shared) = (shared.clone(), shared.clone(), shared);
+    tokio::spawn(async move {
+        if let Err(error) = bridge::run(settings, station, bridge_shared, port, from_node, bridge_to_node).await {
+            log::error!("AllStar bridge failed: {error:#}");
+        }
+    });
+    let (node_config, schedule_config) = (allstar.clone(), allstar);
+    tokio::spawn(async move {
+        if let Err(error) = node::run(node_config, node_shared, speaker, from_bridge, node_to_bridge, node_commands).await {
+            log::error!("AllStar node failed: {error:#}");
+        }
+    });
+    tokio::spawn(run_schedule(schedule_config, handle.clone(), schedule_shared));
+    handle
 }
 
 #[derive(Debug, PartialEq)]

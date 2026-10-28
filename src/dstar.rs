@@ -1,4 +1,4 @@
-// D-STAR header and voice frame types, shared by the modem driver and the reflector links
+// D-STAR header and voice frame types, shared by the modem driver, the reflector links and the bridges
 
 use crc::{Crc, CRC_16_IBM_SDLC};
 use zerocopy::byteorder::{LittleEndian, U16};
@@ -33,6 +33,26 @@ pub enum Frame {
     Header(Header),
     Voice { sequence: u8, ambe: [u8; 9], slow_data: [u8; 3] },
     End,
+}
+
+const SYNC_SLOW_DATA: [u8; 3] = [0x55, 0x2D, 0x16];
+const NULL_SLOW_DATA: [u8; 3] = [0x16, 0x29, 0xF5];
+const SLOW_DATA_SCRAMBLER: [u8; 3] = [0x70, 0x4F, 0x93];
+
+// Lay the text message out over the first 8 frames of each superframe, then idle
+pub fn build_slow_data_blocks(message: &str) -> Vec<[u8; 3]> {
+    let mut text = [b' '; 20];
+    for (slot, byte) in text.iter_mut().zip(message.bytes()) {
+        *slot = byte;
+    }
+    let mut blocks = vec![SYNC_SLOW_DATA];
+    for (index, chunk) in text.chunks(5).enumerate() {
+        for block in [[0x40 + index as u8, chunk[0], chunk[1]], [chunk[2], chunk[3], chunk[4]]] {
+            blocks.push([block[0] ^ SLOW_DATA_SCRAMBLER[0], block[1] ^ SLOW_DATA_SCRAMBLER[1], block[2] ^ SLOW_DATA_SCRAMBLER[2]]);
+        }
+    }
+    blocks.resize(FRAMES_PER_SUPERFRAME as usize, NULL_SLOW_DATA);
+    blocks
 }
 
 // Space-pad a callsign out to a fixed field width
@@ -85,5 +105,13 @@ mod tests {
     fn crc_matches_the_ccitt_check_value() {
         // CRC-16/X-25 of "123456789" is 0x906E
         assert_eq!(crc_ccitt(b"123456789"), 0x906E);
+    }
+
+    #[test]
+    fn slow_data_matches_the_layout_of_the_python_bridge() {
+        let blocks = build_slow_data_blocks("AllStar 54207");
+        assert_eq!(blocks.len(), 21);
+        assert_eq!(blocks[..9], [[0x55, 0x2D, 0x16], [0x30, 0x0E, 0xFF], [0x1C, 0x1C, 0xE7], [0x31, 0x2E, 0xE1], [0x50, 0x7A, 0xA7], [0x32, 0x7D, 0xA3], [0x47, 0x6F, 0xB3], [0x33, 0x6F, 0xB3], [0x50, 0x6F, 0xB3]]);
+        assert!(blocks[9..].iter().all(|block| *block == NULL_SLOW_DATA));
     }
 }

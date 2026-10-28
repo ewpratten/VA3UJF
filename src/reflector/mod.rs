@@ -1,25 +1,29 @@
 // Reflector links over DCS and DExtra, as an outgoing client of a single reflector at a time
 
+mod dcs;
+mod dextra;
 mod packets;
+pub mod park;
+mod protocol;
 
-use crate::config::{Config, Protocol, Reflector};
+use crate::config::{Config, Reflector};
 use crate::hosts::{self, Directory};
+use crate::router::Port;
 use crate::speech::{self, Speaker};
-use crate::state::{self, LinkStatus, Shared};
+use crate::state::{self, Shared};
 use crate::dstar::{pad, Frame, Header, END_SLOW_DATA, FRAMES_PER_SUPERFRAME};
-use packets::{ConnectPacket, DcsLinkPacket, DcsPoll, DcsUnlinkPacket, DcsVoicePacket, DextraPoll, DsvtHeaderPacket, DsvtVoicePacket, END_AMBE, HEADER_SEQUENCE, LAST_FRAME_FLAG};
+use packets::{END_AMBE, HEADER_SEQUENCE, LAST_FRAME_FLAG};
+use protocol::{implementation, Endpoint, ReflectorProtocol, Transmit};
 use anyhow::{bail, Context};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
-use zerocopy::{FromBytes, IntoBytes};
 
-const DCS_PORT: u16 = 30051;
-const DEXTRA_PORT: u16 = 30001;
-const DCS_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const DEXTRA_POLL_INTERVAL: Duration = Duration::from_secs(10);
+// How the link is named in the status and the transmission log
+pub const LINK_NAME: &str = "reflector";
+pub const LINK_KIND: &str = "reflector";
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const LINK_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(1);
@@ -30,6 +34,7 @@ pub enum Command {
 
 struct Active {
     reflector: Reflector,
+    protocol: Box<dyn ReflectorProtocol>,
     module: u8,
     socket: UdpSocket,
     destination: SocketAddr,
@@ -42,45 +47,18 @@ struct Active {
 // Stream bookkeeping for each direction
 #[derive(Default)]
 struct Streams {
-    transmit_id: u16,
-    transmit_sequence: u8,
-    transmit_count: u32,
-    transmit_header: Option<Header>,
+    transmit: Transmit,
     receive_id: Option<u16>,
     receive_last: Option<Instant>,
 }
 
 impl Active {
-    fn protocol(&self) -> Protocol {
-        self.reflector.protocol
-    }
-
     fn target_text(&self) -> String {
         format!("{} {}", self.reflector.name, self.module as char)
     }
 
-    fn connect_packet(&self, config: &Config, unlink: bool) -> Vec<u8> {
-        let remote_module = if unlink { b' ' } else { self.module };
-        let connect = ConnectPacket::new(&config.station.callsign, config.station.module.as_bytes()[0], remote_module);
-        match (self.protocol(), unlink) {
-            (Protocol::Dextra, _) => connect.as_bytes().to_vec(),
-            (Protocol::Dcs, true) => DcsUnlinkPacket { connect, reflector: pad(&self.reflector.name) }.as_bytes().to_vec(),
-            (Protocol::Dcs, false) => DcsLinkPacket::new(DcsUnlinkPacket { connect, reflector: pad(&self.reflector.name) }).as_bytes().to_vec(),
-        }
-    }
-
-    fn poll_packet(&self, config: &Config) -> Vec<u8> {
-        let mut callsign = pad::<8>(&config.station.callsign);
-        callsign[7] = config.station.module.as_bytes()[0];
-        let poll = DextraPoll { callsign, terminator: 0 };
-        match self.protocol() {
-            Protocol::Dcs => {
-                let mut reflector = pad::<8>(&self.reflector.name);
-                reflector[7] = self.module;
-                DcsPoll { poll, reflector }.as_bytes().to_vec()
-            }
-            Protocol::Dextra => poll.as_bytes().to_vec(),
-        }
+    fn endpoint<'a>(&'a self, config: &'a Config) -> Endpoint<'a> {
+        Endpoint { callsign: &config.station.callsign, local_module: config.station.module.as_bytes()[0], reflector: &self.reflector.name, module: self.module }
     }
 
     async fn send(&self, packet: &[u8]) {
@@ -92,7 +70,8 @@ impl Active {
 
 async fn open(directory: &Directory, name: &str, module: char) -> anyhow::Result<Active> {
     let reflector = hosts::find(directory, name).with_context(|| format!("unknown reflector {name}"))?;
-    let port = reflector.port.unwrap_or(if reflector.protocol == Protocol::Dcs { DCS_PORT } else { DEXTRA_PORT });
+    let protocol = implementation(reflector.protocol);
+    let port = reflector.port.unwrap_or(protocol.default_port());
     let destination = lookup_host((reflector.address.as_str(), port)).await?.find(SocketAddr::is_ipv4).with_context(|| format!("couldn't resolve {}", reflector.address))?;
     if !module.is_ascii_uppercase() {
         bail!("reflector module must be a letter");
@@ -100,54 +79,49 @@ async fn open(directory: &Directory, name: &str, module: char) -> anyhow::Result
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     log::info!("Linking {} {module} at {destination} over {:?}", reflector.name, reflector.protocol);
     let now = Instant::now();
-    Ok(Active { reflector, module: module as u8, socket, destination, connected: false, last_heard: now, last_connect: None, last_poll: now })
+    Ok(Active { reflector, protocol, module: module as u8, socket, destination, connected: false, last_heard: now, last_connect: None, last_poll: now })
 }
 
-fn transmit_voice(active: &Active, streams: &mut Streams, ambe: [u8; 9], slow_data: [u8; 3], end: bool) -> Option<Vec<u8>> {
-    let header = streams.transmit_header.as_ref()?;
-    let sequence = if end { streams.transmit_sequence | LAST_FRAME_FLAG } else { streams.transmit_sequence };
-    let packet = match active.protocol() {
-        Protocol::Dextra => DsvtVoicePacket::new(streams.transmit_id, sequence, ambe, slow_data).as_bytes().to_vec(),
-        Protocol::Dcs => DcsVoicePacket::new(*header, streams.transmit_id, sequence, ambe, slow_data, streams.transmit_count).as_bytes().to_vec(),
-    };
-    streams.transmit_sequence = (streams.transmit_sequence + 1) % FRAMES_PER_SUPERFRAME;
-    streams.transmit_count += 1;
+fn transmit_voice(active: &Active, transmit: &mut Transmit, ambe: [u8; 9], slow_data: [u8; 3], end: bool) -> Option<Vec<u8>> {
+    transmit.header.as_ref()?;
+    let sequence = if end { transmit.sequence | LAST_FRAME_FLAG } else { transmit.sequence };
+    let packet = active.protocol.voice_packet(transmit, sequence, ambe, slow_data);
+    transmit.sequence = (transmit.sequence + 1) % FRAMES_PER_SUPERFRAME;
+    transmit.count += 1;
     Some(packet)
 }
 
 // Turn a frame heading out to the reflector into packets, updating the transmit stream
 async fn transmit(active: &Active, config: &Config, streams: &mut Streams, frame: Frame) {
+    let transmit = &mut streams.transmit;
     match frame {
         Frame::Header(mut header) => {
             header.repeater_1 = pad::<8>(&format!("{:<7}{}", config.station.callsign, config.station.module));
             header.repeater_2 = pad::<8>(&format!("{:<7}{}", active.reflector.name, active.module as char));
             header.your_call = pad::<8>("CQCQCQ");
-            streams.transmit_id = (streams.transmit_id.wrapping_mul(25173).wrapping_add(13849)) | 1;
-            streams.transmit_sequence = 0;
-            streams.transmit_count = 0;
-            if active.protocol() == Protocol::Dextra {
-                let packet = DsvtHeaderPacket::new(streams.transmit_id, header).as_bytes().to_vec();
-                for _ in 0..2 {
-                    active.send(&packet).await;
-                }
+            transmit.id = (transmit.id.wrapping_mul(25173).wrapping_add(13849)) | 1;
+            transmit.sequence = 0;
+            transmit.count = 0;
+            transmit.header = Some(header);
+            for packet in active.protocol.header_packets(transmit) {
+                active.send(&packet).await;
             }
-            streams.transmit_header = Some(header);
         }
         Frame::Voice { ambe, slow_data, .. } => {
-            if let Some(packet) = transmit_voice(active, streams, ambe, slow_data, false) {
+            if let Some(packet) = transmit_voice(active, transmit, ambe, slow_data, false) {
                 active.send(&packet).await;
             }
         }
         Frame::End => {
-            if let Some(packet) = transmit_voice(active, streams, END_AMBE, END_SLOW_DATA, true) {
+            if let Some(packet) = transmit_voice(active, transmit, END_AMBE, END_SLOW_DATA, true) {
                 active.send(&packet).await;
             }
-            streams.transmit_header = None;
+            transmit.header = None;
         }
     }
 }
 
-// Turn a packet from the reflector into frames for the modem.
+// Turn a packet from the reflector into frames for the router
 async fn receive(active: &mut Active, config: &Config, streams: &mut Streams, packet: &[u8], from_reflector: &mpsc::Sender<Frame>, speaker: &Option<Speaker>) -> anyhow::Result<()> {
     active.last_heard = Instant::now();
     let length = packet.len();
@@ -171,33 +145,15 @@ async fn receive(active: &mut Active, config: &Config, streams: &mut Streams, pa
     }
 
     // Keepalives are answered in kind
-    let is_poll = match active.protocol() {
-        Protocol::Dcs => length == 22 || length == 17,
-        Protocol::Dextra => length == 9,
-    };
-    if is_poll {
-        if length != 17 {
-            let reply = active.poll_packet(config);
+    if let Some(wants_reply) = active.protocol.keepalive(packet) {
+        if wants_reply {
+            let reply = active.protocol.poll_packet(&active.endpoint(config));
             active.send(&reply).await;
         }
         return Ok(());
     }
 
-    // Voice, as (stream id, header, sequence, ambe, slow data)
-    let parsed = match active.protocol() {
-        Protocol::Dextra => match DsvtHeaderPacket::read_from_bytes(packet) {
-            Ok(dsvt) if dsvt.prefix.is_valid() && dsvt.prefix.sequence == HEADER_SEQUENCE => Some((dsvt.prefix.stream_id.get(), Some(dsvt.header.header), HEADER_SEQUENCE, [0; 9], [0; 3])),
-            _ => match DsvtVoicePacket::read_from_bytes(packet) {
-                Ok(dsvt) if dsvt.prefix.is_valid() => Some((dsvt.prefix.stream_id.get(), None, dsvt.prefix.sequence, dsvt.ambe, dsvt.slow_data)),
-                _ => None,
-            },
-        },
-        Protocol::Dcs => match DcsVoicePacket::read_from_bytes(packet) {
-            Ok(dcs) if dcs.is_valid() => Some((dcs.stream_id.get(), Some(dcs.header), dcs.sequence, dcs.ambe, dcs.slow_data)),
-            _ => None,
-        },
-    };
-    let Some((stream_id, header, sequence, ambe, slow_data)) = parsed else { return Ok(()) };
+    let Some(protocol::Voice { stream_id, header, sequence, ambe, slow_data }) = active.protocol.decode_voice(packet) else { return Ok(()) };
     if sequence == HEADER_SEQUENCE {
         return Ok(forward_header(streams, stream_id, header, from_reflector).await);
     }
@@ -229,12 +185,28 @@ async fn forward_header(streams: &mut Streams, stream_id: u16, header: Option<He
     }
 }
 
+fn publish(shared: &Shared, active: Option<&Active>) {
+    let target = active.map(Active::target_text);
+    let connected = active.is_some_and(|link| link.connected);
+    let spoken = match (&target, connected) {
+        (Some(target), true) => format!("Linked to reflector {}.", speech::spoken_reflector(target)),
+        (Some(target), false) => format!("Linking to reflector {}.", speech::spoken_reflector(target)),
+        (None, _) => "Not linked to a reflector.".to_string(),
+    };
+    state::update(shared, |snapshot| {
+        let status = state::link_mut(snapshot, LINK_NAME, LINK_KIND);
+        (status.target, status.connected, status.spoken) = (target, connected, spoken);
+    });
+}
+
 // Run the reflector link manager, taking link and unlink commands, and bridging frames in both directions
-pub async fn run(config: Config, directory: Directory, mut commands: mpsc::Receiver<Command>, from_reflector: mpsc::Sender<Frame>, mut to_reflector: mpsc::Receiver<Frame>, shared: Shared, speaker: Option<Speaker>) {
+pub async fn run(config: Config, directory: Directory, mut commands: mpsc::Receiver<Command>, port: Port, shared: Shared, speaker: Option<Speaker>) {
+    let Port { to_router: from_reflector, from_router: mut to_reflector } = port;
     let mut active: Option<Active> = None;
     let mut streams = Streams::default();
     let mut tick = interval(Duration::from_millis(250));
     let mut buffer = vec![0u8; 2048];
+    publish(&shared, None);
 
     // Link the startup reflector, written as "NAME M"
     if let Some(startup) = &config.startup_reflector {
@@ -270,7 +242,7 @@ pub async fn run(config: Config, directory: Directory, mut commands: mpsc::Recei
 
                 // Politely drop the old link before changing anything
                 if let Some(link) = active.take() {
-                    let packet = link.connect_packet(&config, true);
+                    let packet = link.protocol.connect_packet(&link.endpoint(&config), true);
                     link.send(&packet).await;
                     log::info!("Unlinked from {}", link.target_text());
                     if link.connected {
@@ -301,13 +273,12 @@ pub async fn run(config: Config, directory: Directory, mut commands: mpsc::Recei
                     }
                     if !link.connected && link.last_connect.is_none_or(|sent| now.duration_since(sent) >= CONNECT_RETRY_INTERVAL) {
                         link.last_connect = Some(now);
-                        let packet = link.connect_packet(&config, false);
+                        let packet = link.protocol.connect_packet(&link.endpoint(&config), false);
                         link.send(&packet).await;
                     }
-                    let poll_interval = if link.protocol() == Protocol::Dcs { DCS_POLL_INTERVAL } else { DEXTRA_POLL_INTERVAL };
-                    if link.connected && now.duration_since(link.last_poll) >= poll_interval {
+                    if link.connected && now.duration_since(link.last_poll) >= link.protocol.poll_interval() {
                         link.last_poll = now;
-                        let packet = link.poll_packet(&config);
+                        let packet = link.protocol.poll_packet(&link.endpoint(&config));
                         link.send(&packet).await;
                     }
 
@@ -320,7 +291,6 @@ pub async fn run(config: Config, directory: Directory, mut commands: mpsc::Recei
                 }
             }
         }
-        let link = LinkStatus { target: active.as_ref().map(Active::target_text), connected: active.as_ref().is_some_and(|link| link.connected) };
-        state::update(&shared, |snapshot| snapshot.link = link);
+        publish(&shared, active.as_ref());
     }
 }

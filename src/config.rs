@@ -85,9 +85,12 @@ pub struct Allstar {
     pub tx_gain_db: f32,
 }
 
-// Spoken announcements, made by a Piper voice running inside this program and vocoded through the AllStar section's AMBEserver
+// Spoken announcements, made by a Piper voice running inside this program and vocoded through an AMBEserver
 #[derive(Deserialize, Clone)]
 pub struct Speech {
+    // Defaults to the AllStar section's AMBEserver
+    pub ambeserver: Option<String>,
+
     // Holds the voice's .onnx model, its tokens.txt, and its espeak-ng-data
     #[serde(default = "default_voice_directory")]
     pub voice_directory: PathBuf,
@@ -188,8 +191,8 @@ impl Config {
         if let Some(allstar) = &config.allstar {
             crate::allstar::validate_schedule(&allstar.schedule)?;
         }
-        if config.speech.is_some() && config.allstar.is_none() {
-            anyhow::bail!("speech needs an [allstar] section, since announcements are vocoded through its AMBEserver");
+        if config.speech.as_ref().is_some_and(|speech| speech.ambeserver.is_none()) && config.allstar.is_none() {
+            anyhow::bail!("speech needs an AMBEserver to vocode through: set ambeserver in [speech], or add an [allstar] section to borrow its");
         }
         Ok(config)
     }
@@ -199,12 +202,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn speech_without_an_allstar_section_is_refused() {
+    fn speech_without_an_ambeserver_is_refused() {
         let path = std::env::temp_dir().join(format!("va3ujf-speech-only-{}.toml", std::process::id()));
         std::fs::write(&path, "[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0\n[modem]\nport = \"/dev/null\"\n[speech]\n").unwrap();
         let error = super::Config::load(&path).err().expect("speech alone to be refused");
         std::fs::remove_file(&path).ok();
         assert!(format!("{error:#}").contains("[allstar]"), "{error:#}");
+    }
+
+    #[test]
+    fn speech_can_bring_its_own_ambeserver() {
+        let path = std::env::temp_dir().join(format!("va3ujf-speech-own-{}.toml", std::process::id()));
+        std::fs::write(&path, "[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0\n[modem]\nport = \"/dev/null\"\n[speech]\nambeserver = \"127.0.0.1:2460\"\n").unwrap();
+        let loaded = super::Config::load(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(loaded.is_ok());
     }
 
     #[test]
