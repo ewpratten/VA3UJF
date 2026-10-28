@@ -1,0 +1,33 @@
+name: Report to ewconfig
+
+# Tells the ewconfig monorepo how CI went here, so it shows up in that repo's pipelines. Needs the
+# EWCONFIG_CALLBACK_TOKEN secret, with only Actions write access on ewpratten/ewconfig
+
+on:
+  workflow_run:
+    workflows: [Image]
+    types: [completed]
+    branches: [master]
+
+permissions: {}
+
+jobs:
+  report:
+    name: Report
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.event == 'push' }}
+    steps:
+      - name: Dispatch result
+        run: |
+          gh workflow run subproject-ci.yml -R ewpratten/ewconfig \
+            -f repo="$GITHUB_REPOSITORY" \
+            -f workflow="$WORKFLOW_NAME" \
+            -f commit="$COMMIT" \
+            -f conclusion="$CONCLUSION" \
+            -f run_url="$RUN_URL"
+        env:
+          GH_TOKEN: ${{ secrets.EWCONFIG_CALLBACK_TOKEN }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          COMMIT: ${{ github.event.workflow_run.head_sha }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
