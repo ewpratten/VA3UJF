@@ -141,11 +141,13 @@ fn set_config_payload(protocol_version: u8, modem: &Modem) -> Vec<u8> {
     payload
 }
 
+// The modem checks the POCSAG transmit frequency against its bands even though D-STAR never uses it, so it can't be left blank
 fn set_frequency_payload(frequency_hz: u32, rf_level: f32) -> Vec<u8> {
     let mut payload = vec![0u8; 14];
     payload[1..5].copy_from_slice(&frequency_hz.to_le_bytes());
     payload[5..9].copy_from_slice(&frequency_hz.to_le_bytes());
     payload[9] = level_byte(rf_level);
+    payload[10..14].copy_from_slice(&frequency_hz.to_le_bytes());
     payload
 }
 
@@ -260,5 +262,22 @@ pub async fn run(modem: Modem, station: Station, shared: Shared, from_modem: mps
             Err(error) => log::error!("Couldn't start modem: {error:#}"),
         }
         sleep(RECONNECT_DELAY).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_frequency_fills_every_field_the_modem_checks() {
+        // MMDVMHost's layout: a spare byte, receive and transmit frequencies, power, then the POCSAG frequency
+        let payload = set_frequency_payload(446_500_000, 50.0);
+        assert_eq!(payload.len(), 14);
+        assert_eq!(payload[0], 0);
+        assert_eq!(payload[1..5], 446_500_000u32.to_le_bytes());
+        assert_eq!(payload[5..9], 446_500_000u32.to_le_bytes());
+        assert_eq!(payload[9], 128);
+        assert_eq!(payload[10..14], 446_500_000u32.to_le_bytes());
     }
 }
