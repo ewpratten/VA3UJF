@@ -50,8 +50,6 @@ pub struct Modem {
 #[derive(Deserialize, Clone)]
 pub struct Aprs {
     pub server: String,
-    #[serde(default = "default_ssid")]
-    pub ssid: u8,
     #[serde(default = "default_beacon_minutes")]
     pub beacon_minutes: u64,
 }
@@ -165,7 +163,6 @@ fn default_hosts_refresh_hours() -> u64 { 72 }
 fn default_baud() -> u32 { 115200 }
 fn default_tx_delay_ms() -> u32 { 100 }
 fn default_level() -> f32 { 50.0 }
-fn default_ssid() -> u8 { 10 }
 fn default_beacon_minutes() -> u64 { 20 }
 
 impl Config {
