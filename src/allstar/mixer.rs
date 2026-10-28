@@ -1,8 +1,8 @@
 // Jitter buffering and mixing of the 20 ms audio frames that links and the hotspot trade
 
+use crate::codec::SAMPLES_PER_FRAME;
 use std::collections::VecDeque;
 
-pub const SAMPLES_PER_FRAME: usize = 160;
 const PREFILL_FRAMES: usize = 2;
 const MAX_BUFFERED_FRAMES: usize = 10;
 

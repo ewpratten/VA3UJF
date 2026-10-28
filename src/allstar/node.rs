@@ -2,14 +2,13 @@
 
 use super::directory::{is_node_number, Directory};
 use super::iax2::{self, command, control, ie, Datagram, Event, FullFrame, Ies, Session, FORMAT_ULAW, PROTOCOL_VERSION};
-use super::mixer::{mix, Buffer, SAMPLES_PER_FRAME};
+use super::mixer::{mix, Buffer};
 use super::tokens::Tokens;
-use super::{network, Audio, Command, LinkMode};
-use audio_codec_algorithms::{decode_ulaw, encode_ulaw};
-use crate::config::{Allstar, Station};
-use crate::reflector;
+use super::{network, Command, LinkMode};
+use crate::codec::{ulaw, Audio, SAMPLES_PER_FRAME};
+use crate::config::Allstar;
 use crate::speech::{self, Speaker};
-use crate::state::{self, AllstarLink, Shared};
+use crate::state::{self, PeerStatus, Shared};
 use anyhow::Context;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -127,6 +126,17 @@ enum Internal {
     Verified { address: SocketAddr, frame: FullFrame, calling: String, verdict: Result<(), String> },
 }
 
+// How the node's links sound when read out
+fn spoken_links(node: u32, peers: &[PeerStatus]) -> String {
+    let linked: Vec<String> = peers.iter().filter(|peer| peer.connected).map(|peer| peer.id.clone()).collect();
+    let node = speech::spelled(&node.to_string());
+    match linked.len() {
+        0 => format!("All Star node {node} has no links."),
+        1 => format!("All Star node {node} is linked to node {}.", speech::spoken_list(&linked)),
+        _ => format!("All Star node {node} is linked to nodes {}.", speech::spoken_list(&linked)),
+    }
+}
+
 struct Node {
     allstar: Allstar,
     shared: Shared,
@@ -134,7 +144,6 @@ struct Node {
     directory: Arc<Directory>,
     internal: mpsc::Sender<Internal>,
     to_bridge: mpsc::Sender<Audio>,
-    reflector_commands: mpsc::Sender<reflector::Command>,
     speaker: Option<Speaker>,
     links: Vec<Link>,
     dstar_buffer: Buffer,
@@ -144,11 +153,6 @@ struct Node {
     next_call: u16,
     tokens: Tokens,
     verifying: HashSet<(SocketAddr, u16)>,
-    parked_reflector: Option<String>,
-}
-
-fn pcm_to_bytes(samples: &[i16]) -> Vec<u8> {
-    samples.iter().flat_map(|sample| sample.to_le_bytes()).collect()
 }
 
 fn adjust_listed_mode(through: char, entry: &str) -> String {
@@ -212,15 +216,15 @@ impl Node {
     }
 
     fn publish(&self) {
-        let links: Vec<AllstarLink> = self
+        let peers: Vec<PeerStatus> = self
             .links
             .iter()
-            .map(|link| AllstarLink { node: link.node.clone(), mode: if link.mode == LinkMode::Monitor { "monitor" } else { "transceive" }, outbound: link.outbound, connected: link.up, keyed: link.rx_keyed || link.tx_keyed })
+            .map(|link| PeerStatus { id: link.node.clone(), mode: if link.mode == LinkMode::Monitor { "monitor" } else { "transceive" }, outbound: link.outbound, connected: link.up, keyed: link.rx_keyed || link.tx_keyed })
             .collect();
+        let spoken = spoken_links(self.allstar.node, &peers);
         state::update(&self.shared, |snapshot| {
-            if let Some(status) = snapshot.allstar.as_mut() {
-                status.links = links;
-            }
+            let status = state::link_mut(snapshot, super::LINK_NAME, super::LINK_KIND);
+            (status.connected, status.peers, status.spoken) = (peers.iter().any(|peer| peer.connected), peers, spoken);
         });
     }
 
@@ -493,28 +497,9 @@ impl Node {
         self.after_links_changed(now);
     }
 
-    // The links changed, so the web UI, the stats and the reflector all want to know
+    // The links changed, so the web UI, the stats and anything else watching want to know
     fn after_links_changed(&mut self, _now: Instant) {
         self.publish();
-        if !self.allstar.park_reflector {
-            return;
-        }
-        let any_up = self.links.iter().any(|link| link.up);
-        let reflector = state::read(&self.shared).link.target;
-        if any_up && self.parked_reflector.is_none() {
-            if let Some(target) = reflector {
-                log::info!("AllStar: leaving {target} while the node has links");
-                self.parked_reflector = Some(target);
-                let _ = self.reflector_commands.try_send(reflector::Command::Unlink);
-            }
-        } else if !any_up && reflector.is_none() {
-            if let Some((name, module)) = self.parked_reflector.take().and_then(|target| target.rsplit_once(' ').and_then(|(name, module)| Some((name.to_string(), module.chars().next()?)))) {
-                log::info!("AllStar: no links left, returning to {name} {module}");
-                let _ = self.reflector_commands.try_send(reflector::Command::Link { name, module });
-            }
-        } else if !any_up {
-            self.parked_reflector = None;
-        }
     }
 
     // ---- What links tell us ----
@@ -646,7 +631,7 @@ impl Node {
         if !link.rx_keyed {
             return;
         }
-        link.rx_samples.extend(payload.iter().copied().map(decode_ulaw));
+        link.rx_samples.extend(ulaw::decode(payload));
         while self.links[index].rx_samples.len() >= SAMPLES_PER_FRAME {
             let frame: Vec<i16> = self.links[index].rx_samples.drain(..SAMPLES_PER_FRAME).collect();
             self.links[index].rx_buffer.push(frame);
@@ -689,7 +674,7 @@ impl Node {
                 }
             }
             let frames: Vec<&Vec<i16>> = others.iter().filter_map(|(_, frame)| frame.as_ref()).collect();
-            session.send_voice(now, FORMAT_ULAW, &mix(&frames).into_iter().map(encode_ulaw).collect::<Vec<u8>>());
+            session.send_voice(now, FORMAT_ULAW, &ulaw::encode(&mix(&frames)));
         }
 
         // The hotspot hears all the links, and is told when the last one stops
@@ -697,7 +682,7 @@ impl Node {
         if sources.iter().any(|(source, _)| matches!(source, Source::Link(_))) {
             self.bridge_active = true;
             if !link_frames.is_empty() {
-                let _ = self.to_bridge.try_send(Audio::Voice(pcm_to_bytes(&mix(&link_frames))));
+                let _ = self.to_bridge.try_send(Audio::Voice(mix(&link_frames)));
             }
         } else if self.bridge_active {
             self.bridge_active = false;
@@ -707,10 +692,10 @@ impl Node {
 
     fn handle_bridge_audio(&mut self, audio: Audio, now: Instant) {
         match audio {
-            Audio::Voice(bytes) => {
+            Audio::Voice(samples) => {
                 self.dstar_keyed = true;
                 self.dstar_heard = now;
-                self.dstar_buffer.push(bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect());
+                self.dstar_buffer.push(samples);
             }
             Audio::End => self.dstar_keyed = false,
         }
@@ -817,8 +802,7 @@ impl Node {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_commands: mpsc::Sender<reflector::Command>, speaker: Option<Speaker>, mut from_bridge: mpsc::Receiver<Audio>, to_bridge: mpsc::Sender<Audio>, mut commands: mpsc::Receiver<Command>) -> anyhow::Result<()> {
+pub async fn run(allstar: Allstar, shared: Shared, speaker: Option<Speaker>, mut from_bridge: mpsc::Receiver<Audio>, to_bridge: mpsc::Sender<Audio>, mut commands: mpsc::Receiver<Command>) -> anyhow::Result<()> {
     let socket = Arc::new(UdpSocket::bind(("0.0.0.0", allstar.iax_port)).await.with_context(|| format!("couldn't bind IAX2 port {}", allstar.iax_port))?);
     let directory = Arc::new(Directory::new(&allstar.dns_domain, &allstar.nodes)?);
     log::info!("AllStar node {} listening for IAX2 on port {}", allstar.node, allstar.iax_port);
@@ -838,7 +822,6 @@ pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_
         directory,
         internal,
         to_bridge,
-        reflector_commands,
         speaker,
         links: Vec::new(),
         dstar_buffer: Buffer::default(),
@@ -848,8 +831,8 @@ pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_
         next_call: 1,
         tokens: Tokens::new(),
         verifying: HashSet::new(),
-        parked_reflector: None,
     };
+    node.publish();
     let mut tick = interval(TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut buffer = vec![0u8; 2048];

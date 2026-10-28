@@ -1,7 +1,9 @@
-// Spoken announcements: text is turned into speech by a Piper voice running in this process, as 8 kHz audio for the bridge to transmit
+// Spoken announcements: text is turned into speech by a Piper voice running in this process, as 8 kHz audio for a bridge to transmit
 
-use crate::allstar::Audio;
+use crate::bridge;
+use crate::codec::{Audio, SAMPLES_PER_FRAME};
 use crate::config::{Speech, Station};
+use crate::router::{Router, Scope};
 use crate::state::{self, Shared, Snapshot};
 use anyhow::Context;
 use sherpa_onnx::{GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsModelConfig, OfflineTtsVitsModelConfig};
@@ -11,8 +13,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, timeout};
 
+// Shown as the announcement's "name" on radios that display it
+const ANNOUNCEMENT_SUFFIX: &str = "INFO";
+
 const OUTPUT_RATE: u32 = 8000;
-const SAMPLES_PER_FRAME: usize = 160;
 const FRAME_INTERVAL: Duration = Duration::from_millis(20);
 
 // Radios take a moment to open up, so the first words would be lost without some silence ahead of them
@@ -66,7 +70,7 @@ pub fn spoken_reflector(target: &str) -> String {
     }
 }
 
-fn spoken_list(nodes: &[String]) -> String {
+pub fn spoken_list(nodes: &[String]) -> String {
     let spoken: Vec<String> = nodes.iter().map(|node| spelled(node)).collect();
     match spoken.split_last() {
         Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
@@ -78,22 +82,9 @@ fn spoken_list(nodes: &[String]) -> String {
 // What the repeater would say if asked how it's doing
 pub fn status_text(station: &Station, snapshot: &Snapshot) -> String {
     let mut sentences = vec![format!("{} Homebrew Repeater.", spelled(&station.callsign))];
-    sentences.push(match (&snapshot.link.target, snapshot.link.connected) {
-        (Some(target), true) => format!("Linked to reflector {}.", spoken_reflector(target)),
-        (Some(target), false) => format!("Linking to reflector {}.", spoken_reflector(target)),
-        (None, _) => "Not linked to a reflector.".to_string(),
-    });
-    if let Some(allstar) = &snapshot.allstar {
-        let linked: Vec<String> = allstar.links.iter().filter(|link| link.connected).map(|link| link.node.clone()).collect();
-        let node = spelled(&allstar.node.to_string());
-        sentences.push(match linked.len() {
-            0 => format!("All Star node {node} has no links."),
-            1 => format!("All Star node {node} is linked to node {}.", spoken_list(&linked)),
-            _ => format!("All Star node {node} is linked to nodes {}.", spoken_list(&linked)),
-        });
-        if allstar.registered == Some(false) {
-            sentences.push("The node is not registered with All Star Link.".to_string());
-        }
+    for link in &snapshot.links {
+        sentences.push(link.spoken.clone());
+        sentences.extend(link.warnings.iter().cloned());
     }
     sentences.join(" ")
 }
@@ -180,21 +171,17 @@ impl Synthesizer {
 }
 
 // 20 ms frames of audio, the last one padded out with silence
-fn frames(samples: &[i16]) -> Vec<Vec<u8>> {
-    samples.chunks(SAMPLES_PER_FRAME).map(|chunk| chunk.iter().copied().chain(std::iter::repeat(0)).take(SAMPLES_PER_FRAME).flat_map(i16::to_le_bytes).collect()).collect()
-}
-
-fn channel_is_quiet(snapshot: &Snapshot) -> bool {
-    snapshot.current.is_none() && snapshot.allstar.as_ref().is_none_or(|allstar| allstar.links.iter().all(|link| !link.keyed))
+fn frames(samples: &[i16]) -> Vec<Vec<i16>> {
+    samples.chunks(SAMPLES_PER_FRAME).map(|chunk| chunk.iter().copied().chain(std::iter::repeat(0)).take(SAMPLES_PER_FRAME).collect()).collect()
 }
 
 // Wait for whoever is talking to finish, so an announcement never talks over anyone
 async fn wait_for_quiet(shared: &Shared) -> bool {
     let mut snapshots = shared.subscribe();
     let settled = async {
-        while snapshots.wait_for(channel_is_quiet).await.is_ok() {
+        while snapshots.wait_for(state::channel_is_quiet).await.is_ok() {
             sleep(QUIET_SETTLE).await;
-            if channel_is_quiet(&snapshots.borrow()) {
+            if state::channel_is_quiet(&snapshots.borrow()) {
                 return;
             }
         }
@@ -202,8 +189,25 @@ async fn wait_for_quiet(shared: &Shared) -> bool {
     timeout(QUIET_PATIENCE, settled).await.is_ok()
 }
 
-// Speak each announcement in turn, handing the audio to the bridge at the pace it's heard
-pub async fn run(config: Speech, station: Station, shared: Shared, mut announcements: mpsc::Receiver<Announcement>, to_bridge: mpsc::Sender<Audio>) {
+// Attach the announcer to the router as a link that's only heard on the local radio, and start it. Returns where to send announcements
+pub fn start(config: Speech, ambeserver: String, tx_gain_db: f32, station: Station, shared: Shared, router: &mut Router) -> Speaker {
+    let (speaker, requests) = mpsc::channel(8);
+    let (to_announcer, from_audio) = mpsc::channel(256);
+    let (to_audio, _unused) = mpsc::channel(1);
+    let settings = bridge::Settings { name: "announcements", ambeserver, suffix: ANNOUNCEMENT_SUFFIX.to_string(), message: "Repeater info".to_string(), rx_gain_db: 0.0, tx_gain_db };
+    let port = router.attach("announcement", Scope::LocalOnly);
+    let (bridge_station, bridge_shared) = (station.clone(), shared.clone());
+    tokio::spawn(async move {
+        if let Err(error) = bridge::run(settings, bridge_station, bridge_shared, port, from_audio, to_audio).await {
+            log::error!("Announcement vocoder failed: {error:#}");
+        }
+    });
+    tokio::spawn(run(config, station, shared, requests, to_announcer));
+    speaker
+}
+
+// Speak each announcement in turn, handing the audio on at the pace it's heard
+pub async fn run(config: Speech, station: Station, shared: Shared, mut announcements: mpsc::Receiver<Announcement>, to_announcer: mpsc::Sender<Audio>) {
     let synthesizer = match Synthesizer::load(&config).await {
         Ok(synthesizer) => synthesizer,
         Err(error) => return log::error!("Announcements are off: {error:#}"),
@@ -229,25 +233,21 @@ pub async fn run(config: Speech, station: Station, shared: Shared, mut announcem
         let mut pace = interval(FRAME_INTERVAL);
         for frame in frames(&speech) {
             pace.tick().await;
-            if to_bridge.send(Audio::Voice(frame)).await.is_err() {
+            if to_announcer.send(Audio::Voice(frame)).await.is_err() {
                 return;
             }
         }
-        let _ = to_bridge.send(Audio::End).await;
+        let _ = to_announcer.send(Audio::End).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AllstarLink, AllstarStatus, LinkStatus};
+    use crate::state::LinkStatus;
 
     fn station() -> Station {
         toml::from_str("callsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0").unwrap()
-    }
-
-    fn link(node: &str, connected: bool) -> AllstarLink {
-        AllstarLink { node: node.to_string(), mode: "transceive", outbound: true, connected, keyed: false }
     }
 
     #[test]
@@ -259,13 +259,11 @@ mod tests {
     }
 
     #[test]
-    fn status_describes_the_reflector_and_the_nodes_linked() {
-        let mut snapshot = Snapshot { link: LinkStatus { target: Some("DCS405 A".into()), connected: true }, allstar: Some(AllstarStatus { node: 12345, links: vec![link("54321", true), link("54322", true), link("54323", false)], registered: Some(true), ..Default::default() }), ..Default::default() };
-        assert_eq!(status_text(&station(), &snapshot), "N 0 C A L L Homebrew Repeater. Linked to reflector D C S 4 0 5, module Alpha. All Star node 1 2 3 4 5 is linked to nodes 5 4 3 2 1 and 5 4 3 2 2.");
-        snapshot.link = LinkStatus::default();
-        snapshot.allstar.as_mut().unwrap().links.clear();
-        snapshot.allstar.as_mut().unwrap().registered = Some(false);
-        assert_eq!(status_text(&station(), &snapshot), "N 0 C A L L Homebrew Repeater. Not linked to a reflector. All Star node 1 2 3 4 5 has no links. The node is not registered with All Star Link.");
+    fn status_reads_out_each_link_and_what_is_wrong_with_it() {
+        let reflector = LinkStatus { spoken: "Linked to reflector D C S 4 0 5, module Alpha.".into(), ..LinkStatus::new("reflector", "reflector") };
+        let allstar = LinkStatus { spoken: "All Star node 1 2 3 4 5 has no links.".into(), warnings: vec!["The node is not registered with All Star Link.".into()], ..LinkStatus::new("allstar", "allstar") };
+        let snapshot = Snapshot { links: vec![reflector, allstar], ..Default::default() };
+        assert_eq!(status_text(&station(), &snapshot), "N 0 C A L L Homebrew Repeater. Linked to reflector D C S 4 0 5, module Alpha. All Star node 1 2 3 4 5 has no links. The node is not registered with All Star Link.");
     }
 
     #[test]
@@ -284,7 +282,7 @@ mod tests {
     fn audio_is_cut_into_whole_frames() {
         let cut = frames(&[1; 400]);
         assert_eq!(cut.len(), 3);
-        assert!(cut.iter().all(|frame| frame.len() == SAMPLES_PER_FRAME * 2));
-        assert_eq!(&cut[2][160..164], &[0, 0, 0, 0]);
+        assert!(cut.iter().all(|frame| frame.len() == SAMPLES_PER_FRAME));
+        assert_eq!(&cut[2][80..], &[0; 80]);
     }
 }

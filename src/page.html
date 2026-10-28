@@ -60,7 +60,7 @@
   <div class="card">
     <h2>Services</h2>
     <div class="row"><span>Modem</span><span id="modem">…</span></div>
-    <div class="row"><span>AllStar vocoder</span><span id="vocoder">…</span></div>
+    <div id="vocoders"></div>
     <div class="row"><span>APRS-IS</span><span id="aprs">…</span></div>
     <div class="row"><span>AllStarLink registration</span><span id="registration">…</span></div>
   </div>
@@ -72,28 +72,30 @@
 </main>
 <script>
   const sources = { rf: "RF", reflector: "Reflector", allstar: "AllStar", announcement: "Announcement" };
+  const sourceName = (source) => sources[source] ?? source;
   const flag = (value, good, bad) => value === null ? "Off" : value ? `<span class="good">${good}</span>` : `<span class="bad">${bad}</span>`;
   const text = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
   async function refresh() {
     try {
       const status = await (await fetch("/api/status")).json();
-      document.getElementById("now").innerHTML = status.current ? `<b>${text(status.current.callsign)}</b> via ${sources[status.current.source]}, ${status.current.seconds}s` : "Idle";
-      const link = status.link;
+      document.getElementById("now").innerHTML = status.current ? `<b>${text(status.current.callsign)}</b> via ${sourceName(status.current.source)}, ${status.current.seconds}s` : "Idle";
+      const link = status.links.find((candidate) => candidate.kind === "reflector") ?? { target: null };
       document.getElementById("link").innerHTML = !link.target ? "Not linked" : link.connected ? `<span class="good">Linked to ${text(link.target)}</span>` : `<span class="bad">Linking ${text(link.target)}…</span>`;
       document.getElementById("modem").innerHTML = status.modem_connected ? `<span class="good">Connected</span> ${text(status.modem_firmware)}` : '<span class="bad">Not responding</span>';
-      document.getElementById("vocoder").innerHTML = flag(status.vocoder_connected, "Connected", "Not reachable");
+      document.getElementById("vocoders").innerHTML = status.vocoders.map((vocoder) => `<div class="row"><span>Vocoder (${text(vocoder.name)})</span><span>${flag(vocoder.connected, "Connected", "Not reachable")}</span></div>`).join("");
       document.getElementById("aprs").innerHTML = flag(status.aprs_connected, "Connected", "Disconnected");
       const allstar = status.allstar;
       document.getElementById("allstar-card").hidden = !allstar;
       if (allstar) {
         document.getElementById("allstar-node").textContent = allstar.node;
         document.getElementById("registration").innerHTML = flag(allstar.registered, "Registered", "Not registered");
-        const linkState = (link) => !link.connected ? "Connecting…" : link.keyed ? "Keyed" : "Idle";
-        document.getElementById("allstar-links").innerHTML = allstar.links.length ? allstar.links.map((link) => `<tr><td>${text(link.node)}</td><td>${link.mode}, ${link.outbound ? "outbound" : "inbound"}</td><td>${linkState(link)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(link.node)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>';
+        const peers = (status.links.find((candidate) => candidate.kind === "allstar") ?? { peers: [] }).peers;
+        const peerState = (peer) => !peer.connected ? "Connecting…" : peer.keyed ? "Keyed" : "Idle";
+        document.getElementById("allstar-links").innerHTML = peers.length ? peers.map((peer) => `<tr><td>${text(peer.id)}</td><td>${peer.mode}, ${peer.outbound ? "outbound" : "inbound"}</td><td>${peerState(peer)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(peer.id)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>';
         document.getElementById("allstar-schedule").innerHTML = allstar.schedule.map((run) => `<tr><td>${text(run.name)}</td><td>${new Date(run.next_at * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</td></tr>`).join("");
       }
-      document.getElementById("heard").innerHTML = status.heard.map((entry) => `<tr><td>${new Date(entry.started_at * 1000).toLocaleTimeString()}</td><td>${text(entry.callsign)}</td><td>${sources[entry.source]}</td><td>${entry.seconds}s</td></tr>`).join("");
+      document.getElementById("heard").innerHTML = status.heard.map((entry) => `<tr><td>${new Date(entry.started_at * 1000).toLocaleTimeString()}</td><td>${text(entry.callsign)}</td><td>${sourceName(entry.source)}</td><td>${entry.seconds}s</td></tr>`).join("");
     } catch (error) { /* keep the last view while the hotspot restarts */ }
   }
   refresh();

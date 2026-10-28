@@ -5,6 +5,7 @@ use super::{build_image, container_assets, containers_available, Container, Netw
 use crate::config::Config;
 use crate::dstar::{pad, Frame, Header, HeaderWithCrc};
 use crate::reflector::{self, Command};
+use crate::router::Port;
 use crate::speech::Announcement;
 use crate::{hosts, state};
 use std::time::Duration;
@@ -96,14 +97,14 @@ async fn our_reflector_client_trades_voice_with_a_real_dstargateway() {
     let directory = hosts::directory(&config);
     let shared = state::Shared::default();
     let (commands, command_receiver) = mpsc::channel(4);
-    let (from_reflector_sender, mut from_reflector) = mpsc::channel(256);
-    let (to_reflector, to_reflector_receiver) = mpsc::channel(256);
+    let (to_router, mut from_reflector) = mpsc::channel(256);
+    let (to_reflector, from_router) = mpsc::channel(256);
     let (speaker, mut announcements) = mpsc::channel(8);
-    tokio::spawn(reflector::run(config, directory, command_receiver, from_reflector_sender, to_reflector_receiver, shared.clone(), Some(speaker)));
+    tokio::spawn(reflector::run(config, directory, command_receiver, Port { to_router, from_router }, shared.clone(), Some(speaker)));
     commands.send(Command::Link { name: REFLECTOR_NAME.into(), module: 'B' }).await.unwrap();
     let mut linked = false;
     for _ in 0..100 {
-        linked = state::read(&shared).link.connected;
+        linked = state::read(&shared).links.iter().any(|link| link.kind == reflector::LINK_KIND && link.connected);
         if linked {
             break;
         }

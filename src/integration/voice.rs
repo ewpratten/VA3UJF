@@ -1,6 +1,6 @@
 // Speaks with the real Piper voice, from text through to the paced frames the bridge transmits
 
-use crate::allstar::Audio;
+use crate::codec::Audio;
 use crate::config::{Speech, Station};
 use crate::speech::{self, Announcement, Synthesizer};
 use crate::state::Shared;
@@ -94,7 +94,7 @@ async fn the_announcer_paces_spoken_text_and_a_status_to_the_bridge() {
         loop {
             match tokio::time::timeout(Duration::from_secs(60), from_announcer.recv()).await.expect("audio from the announcer") {
                 Some(Audio::Voice(frame)) => {
-                    assert_eq!(frame.len(), 320);
+                    assert_eq!(frame.len(), 160);
                     frames += 1;
                 }
                 Some(Audio::End) => break,

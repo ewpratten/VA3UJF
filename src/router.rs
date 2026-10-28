@@ -1,4 +1,4 @@
-// Arbitrates the channel between RF, the reflector, AllStar, and announcements, and fans each stream out to where it belongs
+// Arbitrates the channel between the radio and its links, and fans each stream out to where it belongs
 
 use crate::dprs;
 use crate::dstar::{pad, Frame, Header};
@@ -10,13 +10,124 @@ use tokio::time::{interval, Instant};
 
 // Release the channel if a stream goes quiet without an end marker
 const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+const PORT_DEPTH: usize = 256;
 
+// Who a link's voice reaches, and whose voice reaches it
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Source {
-    Rf,
-    Reflector,
-    AllStar,
-    Announcement,
+pub enum Scope {
+    // Hears the radio and every other link, and is heard by all of them
+    Everyone,
+
+    // Hears nothing, and is heard on the radio only. For announcements
+    LocalOnly,
+}
+
+// A link's end of its connection to the router
+pub struct Port {
+    pub to_router: mpsc::Sender<Frame>,
+    pub from_router: mpsc::Receiver<Frame>,
+}
+
+struct Member {
+    kind: &'static str,
+    scope: Scope,
+    to_member: mpsc::Sender<Frame>,
+}
+
+pub struct Router {
+    inbox: mpsc::Receiver<(usize, Frame)>,
+    inbox_sender: mpsc::Sender<(usize, Frame)>,
+
+    // The radio is always the first member
+    members: Vec<Member>,
+}
+
+async fn deliver(members: &[Member], sender: usize, frame: &Frame) {
+    let radio_only = members[sender].scope == Scope::LocalOnly;
+    for (index, member) in members.iter().enumerate() {
+        let reaches = index != sender && member.scope == Scope::Everyone && (!radio_only || index == 0);
+        if reaches {
+            let _ = member.to_member.send(frame.clone()).await;
+        }
+    }
+}
+
+impl Router {
+    // A router with the radio attached, and the radio's port
+    pub fn new() -> (Self, Port) {
+        let (inbox_sender, inbox) = mpsc::channel(PORT_DEPTH);
+        let mut router = Router { inbox, inbox_sender, members: Vec::new() };
+        let radio = router.attach("rf", Scope::Everyone);
+        (router, radio)
+    }
+
+    // Connect a link, which is then named in the transmission log by its kind
+    pub fn attach(&mut self, kind: &'static str, scope: Scope) -> Port {
+        let index = self.members.len();
+        let (to_router, mut from_member) = mpsc::channel(PORT_DEPTH);
+        let (to_member, from_router) = mpsc::channel(PORT_DEPTH);
+        let inbox = self.inbox_sender.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = from_member.recv().await {
+                if inbox.send((index, frame)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        self.members.push(Member { kind, scope, to_member });
+        Port { to_router, from_router }
+    }
+
+    pub async fn run(self, mut taps: RadioTaps, shared: Shared) {
+        // The router stops once every link has gone, which needs it to hold no handle on its own inbox
+        let Router { mut inbox, inbox_sender, members } = self;
+        drop(inbox_sender);
+        let mut active: Option<(usize, Instant)> = None;
+        let mut tick = interval(Duration::from_millis(250));
+
+        loop {
+            let (sender, frame) = tokio::select! {
+                received = inbox.recv() => match received {
+                    Some(received) => received,
+                    None => return,
+                },
+                _ = tick.tick() => {
+                    if active.is_some_and(|(_, heard)| heard.elapsed() > STREAM_TIMEOUT) {
+                        active = None;
+                        state::update(&shared, state::finish_transmission);
+                    }
+                    continue;
+                }
+            };
+
+            // Whoever keys up first holds the channel until they finish
+            let holds_channel = match (&frame, active) {
+                (Frame::Header(_), None) => true,
+                (_, Some((holder, _))) => holder == sender,
+                _ => false,
+            };
+            if !holds_channel {
+                continue;
+            }
+            active = if matches!(frame, Frame::End) { None } else { Some((sender, Instant::now())) };
+
+            // Record the transmission for the web UI
+            let kind = members[sender].kind;
+            match &frame {
+                Frame::Header(header) => {
+                    log::info!("Heard {} via {kind}", header.my_call_text());
+                    state::update(&shared, |snapshot| snapshot.current = Some(Transmission { source: kind, callsign: header.my_call_text(), started_at: state::unix_now(), seconds: 0 }));
+                }
+                Frame::End => state::update(&shared, state::finish_transmission),
+                Frame::Voice { .. } => {}
+            }
+
+            if sender == 0 && taps.observe(&frame) {
+                continue;
+            }
+            deliver(&members, sender, &frame).await;
+        }
+    }
 }
 
 // Sent as the "your call" of a transmission, this asks the repeater to describe itself
@@ -24,111 +135,47 @@ fn is_info_request(header: &Header) -> bool {
     header.your_call == pad::<8>("       I")
 }
 
-pub struct Endpoints {
-    pub from_modem: mpsc::Receiver<Frame>,
-    pub to_modem: mpsc::Sender<Frame>,
-    pub from_reflector: mpsc::Receiver<Frame>,
-    pub to_reflector: mpsc::Sender<Frame>,
-    pub bridge: Option<(mpsc::Receiver<Frame>, mpsc::Sender<Frame>)>,
+// What the repeater does with what it hears directly over RF, before it goes anywhere else
+#[derive(Default)]
+pub struct RadioTaps {
     pub position_reports: Option<mpsc::Sender<String>>,
-    pub announcements: Option<mpsc::Receiver<Frame>>,
     pub speaker: Option<Speaker>,
+    position_collector: dprs::Collector,
+
+    // Whether the stream being heard is a request to the repeater, which goes no further than it
+    request_stream: bool,
 }
 
-async fn deliver(targets: &[&mpsc::Sender<Frame>], frame: &Frame) {
-    for target in targets {
-        let _ = target.send(frame.clone()).await;
+impl RadioTaps {
+    pub fn new(position_reports: Option<mpsc::Sender<String>>, speaker: Option<Speaker>) -> Self {
+        RadioTaps { position_reports, speaker, ..Default::default() }
     }
-}
 
-pub async fn run(mut endpoints: Endpoints, shared: Shared) {
-    let (mut from_bridge, to_bridge) = match endpoints.bridge.take() {
-        Some((receiver, sender)) => (receiver, Some(sender)),
-        None => (mpsc::channel(1).1, None),
-    };
-    let mut from_announcer = endpoints.announcements.take().unwrap_or_else(|| mpsc::channel(1).1);
-    let mut active: Option<(Source, Instant)> = None;
-
-    // Whether the stream being passed along is a request to the repeater, which goes no further than it
-    let mut request_stream = false;
-    let mut tick = interval(Duration::from_millis(250));
-    let mut position_collector = dprs::Collector::default();
-
-    loop {
-        let (source, frame) = tokio::select! {
-            Some(frame) = endpoints.from_modem.recv() => (Source::Rf, frame),
-            Some(frame) = endpoints.from_reflector.recv() => (Source::Reflector, frame),
-            Some(frame) = from_bridge.recv() => (Source::AllStar, frame),
-            Some(frame) = from_announcer.recv() => (Source::Announcement, frame),
-            _ = tick.tick() => {
-                if active.is_some_and(|(_, heard)| heard.elapsed() > STREAM_TIMEOUT) {
-                    active = None;
-                    state::update(&shared, state::finish_transmission);
-                }
-                continue;
-            }
-            else => return,
-        };
-
-        // Whoever keys up first holds the channel until they finish
-        let holds_channel = match (&frame, active) {
-            (Frame::Header(_), None) => true,
-            (_, Some((holder, _))) => holder == source,
-            _ => false,
-        };
-        if !holds_channel {
-            continue;
-        }
-        active = if matches!(frame, Frame::End) { None } else { Some((source, Instant::now())) };
-
-        // Position reports ride in the slow data of what's heard directly over RF
-        if source == Source::Rf {
-            match &frame {
-                Frame::Header(_) | Frame::End => position_collector.reset(),
-                Frame::Voice { slow_data, .. } => {
-                    if let (Some(report), Some(reports)) = (position_collector.push(*slow_data), &endpoints.position_reports)
-                        && reports.try_send(report).is_err()
-                    {
-                        log::warn!("APRS-IS isn't keeping up, dropping a position report");
-                    }
+    // Returns whether the frame was for the repeater alone
+    fn observe(&mut self, frame: &Frame) -> bool {
+        // Position reports ride in the slow data
+        match frame {
+            Frame::Header(_) | Frame::End => self.position_collector.reset(),
+            Frame::Voice { slow_data, .. } => {
+                if let (Some(report), Some(reports)) = (self.position_collector.push(*slow_data), &self.position_reports)
+                    && reports.try_send(report).is_err()
+                {
+                    log::warn!("APRS-IS isn't keeping up, dropping a position report");
                 }
             }
         }
 
-        // An info request over RF is answered out loud, once whoever sent it has finished transmitting
-        if let Frame::Header(header) = &frame {
-            request_stream = source == Source::Rf && is_info_request(header);
-            if request_stream {
+        // An info request is answered out loud, once whoever sent it has finished transmitting
+        if let Frame::Header(header) = frame {
+            self.request_stream = is_info_request(header);
+            if self.request_stream {
                 log::info!("{} asked for repeater info", header.my_call_text());
-                if let Some(speaker) = &endpoints.speaker {
+                if let Some(speaker) = &self.speaker {
                     let _ = speaker.try_send(Announcement::Status);
                 }
             }
         }
-
-        // Record the transmission for the web UI
-        match &frame {
-            Frame::Header(header) => {
-                let source_name = match source { Source::Rf => "rf", Source::Reflector => "reflector", Source::AllStar => "allstar", Source::Announcement => "announcement" };
-                log::info!("Heard {} via {source_name}", header.my_call_text());
-                state::update(&shared, |snapshot| snapshot.current = Some(Transmission { source: source_name, callsign: header.my_call_text(), started_at: state::unix_now(), seconds: 0 }));
-            }
-            Frame::End => state::update(&shared, state::finish_transmission),
-            Frame::Voice { .. } => {}
-        }
-
-        if request_stream {
-            continue;
-        }
-
-        // RF and the reflector both reach AllStar, and AllStar reaches both of them. Announcements are only for the local radio
-        let bridge_target: Vec<&mpsc::Sender<Frame>> = to_bridge.iter().collect();
-        match source {
-            Source::Rf => deliver(&[&[&endpoints.to_reflector][..], &bridge_target[..]].concat(), &frame).await,
-            Source::Reflector => deliver(&[&[&endpoints.to_modem][..], &bridge_target[..]].concat(), &frame).await,
-            Source::AllStar => deliver(&[&endpoints.to_modem, &endpoints.to_reflector], &frame).await,
-            Source::Announcement => deliver(&[&endpoints.to_modem], &frame).await,
-        }
+        self.request_stream
     }
 }
 
@@ -147,24 +194,79 @@ mod tests {
         frames.send(Frame::End).await.unwrap();
     }
 
+    // Whether a transmission starts, skipping the rest of any earlier one
+    async fn heard_header(port: &mut Port) -> bool {
+        while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(2), port.from_router.recv()).await {
+            if matches!(frame, Frame::Header(_)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn heard_nothing(port: &mut Port) -> bool {
+        tokio::time::timeout(Duration::from_millis(300), port.from_router.recv()).await.is_err()
+    }
+
     #[tokio::test]
     async fn an_info_request_is_answered_aloud_and_goes_no_further() {
-        let (from_radio, from_modem) = mpsc::channel(16);
-        let (to_modem, _modem_receiver) = mpsc::channel(16);
-        let (_reflector_sender, from_reflector) = mpsc::channel(16);
-        let (to_reflector, mut reflector_receiver) = mpsc::channel(16);
+        let (mut router, radio) = Router::new();
+        let mut link = router.attach("test", Scope::Everyone);
         let (speaker, mut announcements) = mpsc::channel(4);
-        let endpoints = Endpoints { from_modem, to_modem, from_reflector, to_reflector, bridge: None, position_reports: None, announcements: None, speaker: Some(speaker) };
-        tokio::spawn(run(endpoints, Shared::default()));
+        tokio::spawn(router.run(RadioTaps::new(None, Some(speaker)), Shared::default()));
 
-        // The request is spoken back, and none of it reaches the reflector
-        transmit(&from_radio, "       I").await;
+        // The request is spoken back, and none of it reaches the link
+        transmit(&radio.to_router, "       I").await;
         assert_eq!(announcements.recv().await, Some(Announcement::Status));
-        assert!(tokio::time::timeout(Duration::from_millis(300), reflector_receiver.recv()).await.is_err(), "the request leaked to the reflector");
+        assert!(heard_nothing(&mut link).await, "the request leaked to a link");
 
         // An ordinary transmission right after it still does
-        transmit(&from_radio, "CQCQCQ").await;
-        assert!(matches!(tokio::time::timeout(Duration::from_secs(2), reflector_receiver.recv()).await, Ok(Some(Frame::Header(_)))));
+        transmit(&radio.to_router, "CQCQCQ").await;
+        assert!(heard_header(&mut link).await);
         assert!(announcements.try_recv().is_err(), "an ordinary transmission was taken for an info request");
+    }
+
+    #[tokio::test]
+    async fn links_hear_the_radio_and_each_other_but_never_themselves() {
+        let (mut router, mut radio) = Router::new();
+        let mut first = router.attach("first", Scope::Everyone);
+        let mut second = router.attach("second", Scope::Everyone);
+        tokio::spawn(router.run(RadioTaps::default(), Shared::default()));
+
+        transmit(&first.to_router, "CQCQCQ").await;
+        assert!(heard_header(&mut radio).await && heard_header(&mut second).await);
+        assert!(heard_nothing(&mut first).await, "a link heard its own transmission");
+
+        transmit(&radio.to_router, "CQCQCQ").await;
+        assert!(heard_header(&mut first).await && heard_header(&mut second).await);
+    }
+
+    #[tokio::test]
+    async fn a_local_only_link_is_heard_on_the_radio_alone_and_hears_nothing() {
+        let (mut router, mut radio) = Router::new();
+        let mut link = router.attach("link", Scope::Everyone);
+        let mut announcer = router.attach("announcement", Scope::LocalOnly);
+        tokio::spawn(router.run(RadioTaps::default(), Shared::default()));
+
+        transmit(&announcer.to_router, "CQCQCQ").await;
+        assert!(heard_header(&mut radio).await);
+        assert!(heard_nothing(&mut link).await, "an announcement reached a link");
+
+        transmit(&radio.to_router, "CQCQCQ").await;
+        assert!(heard_header(&mut link).await);
+        assert!(heard_nothing(&mut announcer).await, "the announcer was sent a transmission");
+    }
+
+    #[tokio::test]
+    async fn whoever_keys_up_first_holds_the_channel() {
+        let (mut router, mut radio) = Router::new();
+        let first = router.attach("first", Scope::Everyone);
+        let second = router.attach("second", Scope::Everyone);
+        tokio::spawn(router.run(RadioTaps::default(), Shared::default()));
+
+        first.to_router.send(Frame::Header(header("CQCQCQ"))).await.unwrap();
+        assert!(heard_header(&mut radio).await);
+        second.to_router.send(Frame::Header(header("CQCQCQ"))).await.unwrap();
+        assert!(heard_nothing(&mut radio).await, "a second transmission talked over the first");
     }
 }
