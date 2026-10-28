@@ -3,9 +3,11 @@
 use crate::config::{Modem, Station};
 use crate::state::{self, Shared};
 use crate::dstar::{Frame, HeaderWithCrc};
+use crate::live::Event;
 use anyhow::{bail, Context};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, timeout, Instant};
@@ -92,6 +94,37 @@ impl Encoder<ModemFrame> for MmdvmCodec {
         destination.put_slice(&frame.payload);
         Ok(())
     }
+}
+
+// Raw signal readings against what they mean in dBm, as MMDVMHost's RSSI.dat lists them. In-between values are interpolated
+#[derive(Default)]
+struct Calibration(BTreeMap<u16, i32>);
+
+impl Calibration {
+    fn load(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("couldn't read {}", path.display()))?;
+        let points = text
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                Some((words.next()?.parse().ok()?, words.next()?.parse().ok()?))
+            })
+            .collect();
+        Ok(Calibration(points))
+    }
+
+    fn dbm(&self, raw: u16) -> Option<f32> {
+        let (above_raw, above_dbm) = self.0.range(raw..).next().map(|(raw, dbm)| (*raw, *dbm)).or_else(|| self.0.iter().next_back().map(|(raw, dbm)| (*raw, *dbm)))?;
+        let Some((below_raw, below_dbm)) = self.0.range(..raw).next_back().map(|(raw, dbm)| (*raw, *dbm)).filter(|_| above_raw >= raw) else { return Some(above_dbm as f32) };
+        let position = (raw - below_raw) as f32 / (above_raw - below_raw) as f32;
+        Some((1.0 - position) * below_dbm as f32 + position * above_dbm as f32)
+    }
+}
+
+// The modem appends its average signal reading to a header, and to the first frame of each superframe, when its firmware is built to
+fn signal_reading(payload: &[u8], frame_length: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([*payload.get(frame_length)?, *payload.get(frame_length + 1)?]))
 }
 
 struct Link {
@@ -207,7 +240,7 @@ fn parse_status(protocol_version: u8, payload: &[u8]) -> Option<(bool, u8)> {
     Some((payload.get(flags_index)? & 0x01 == 0x01, *payload.get(3)?))
 }
 
-async fn session(link: &mut Link, from_modem: &mpsc::Sender<Frame>, to_modem: &mut mpsc::Receiver<Frame>) -> anyhow::Result<()> {
+async fn session(link: &mut Link, calibration: &Calibration, shared: &Shared, from_modem: &mpsc::Sender<Frame>, to_modem: &mut mpsc::Receiver<Frame>) -> anyhow::Result<()> {
     let mut status_timer = interval(STATUS_INTERVAL);
     let mut last_status = Instant::now();
     let mut free_slots = 0u8;
@@ -233,12 +266,14 @@ async fn session(link: &mut Link, from_modem: &mpsc::Sender<Frame>, to_modem: &m
                     DSTAR_HEADER => {
                         if let Ok((framed, _)) = HeaderWithCrc::read_from_prefix(&frame.payload) {
                             from_modem.send(Frame::Header(framed.header)).await?;
+                            report_signal(shared, calibration, signal_reading(&frame.payload, size_of::<HeaderWithCrc>()));
                         }
                     }
                     DSTAR_DATA if frame.payload.len() >= 12 => {
                         let ambe = frame.payload[..9].try_into()?;
                         let slow_data = frame.payload[9..12].try_into()?;
                         from_modem.send(Frame::Voice { sequence: 0, ambe, slow_data }).await?;
+                        report_signal(shared, calibration, signal_reading(&frame.payload, 12));
                     }
                     DSTAR_LOST | DSTAR_EOT => from_modem.send(Frame::End).await?,
                     NAK => log::warn!("Modem NAKed command {:#04x}", frame.payload.first().copied().unwrap_or(0)),
@@ -264,14 +299,25 @@ async fn session(link: &mut Link, from_modem: &mpsc::Sender<Frame>, to_modem: &m
     }
 }
 
+fn report_signal(shared: &Shared, calibration: &Calibration, raw: Option<u16>) {
+    if let Some(raw) = raw {
+        shared.emit(Event::Signal { raw, dbm: calibration.dbm(raw) });
+    }
+}
+
 // Run the modem forever, reopening it whenever it drops out
 pub async fn run(modem: Modem, station: Station, shared: Shared, from_modem: mpsc::Sender<Frame>, mut to_modem: mpsc::Receiver<Frame>) {
+    let calibration = modem.rssi_file.as_deref().map(Calibration::load).transpose().unwrap_or_else(|error| {
+        log::warn!("Signal levels won't be in dBm: {error:#}");
+        None
+    });
+    let calibration = calibration.unwrap_or_default();
     loop {
         match connect(&modem, &station, &shared).await {
             Ok(mut link) => {
                 log::info!("Modem ready on {}", modem.port);
                 state::update(&shared, |snapshot| snapshot.modem_connected = true);
-                if let Err(error) = session(&mut link, &from_modem, &mut to_modem).await {
+                if let Err(error) = session(&mut link, &calibration, &shared, &from_modem, &mut to_modem).await {
                     log::error!("Modem session ended: {error:#}");
                 }
                 state::update(&shared, |snapshot| snapshot.modem_connected = false);
@@ -296,6 +342,21 @@ mod tests {
         assert_eq!(payload.tx_hz.get(), 446_500_000);
         assert_eq!(payload.rf_level, 128);
         assert_eq!(payload.pocsag_hz.get(), 446_500_000);
+    }
+
+    #[test]
+    fn signal_readings_are_interpolated_between_calibration_points() {
+        let calibration = Calibration([(1000, -109), (1123, -100), (1134, -90)].into());
+        assert_eq!(calibration.dbm(1123), Some(-100.0));
+        assert!((calibration.dbm(1128).unwrap() + 95.45).abs() < 0.1);
+        assert_eq!((calibration.dbm(10), calibration.dbm(2000)), (Some(-109.0), Some(-90.0)));
+        assert_eq!(Calibration::default().dbm(1000), None);
+    }
+
+    #[test]
+    fn readings_are_only_there_when_the_modem_sends_them() {
+        assert_eq!(signal_reading(&[0; 12], 12), None);
+        assert_eq!(signal_reading(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x5B], 12), Some(0x045B));
     }
 
     #[test]

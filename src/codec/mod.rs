@@ -1,6 +1,7 @@
 // Audio codecs that any link can use to talk to the router, which only carries D-STAR voice
 
 pub mod ambe;
+pub mod fec;
 pub mod ulaw;
 
 // One 20 ms frame of 8 kHz audio

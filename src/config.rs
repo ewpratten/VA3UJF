@@ -13,6 +13,7 @@ pub struct Config {
     pub allstar: Option<Allstar>,
     pub hosts: Option<Hosts>,
     pub speech: Option<Speech>,
+    pub ack: Option<Ack>,
     #[serde(default, rename = "reflector")]
     pub reflectors: Vec<Reflector>,
     pub startup_reflector: Option<String>,
@@ -46,6 +47,9 @@ pub struct Modem {
     pub tx_level: f32,
     #[serde(default = "default_level")]
     pub rf_level: f32,
+
+    // MMDVMHost's RSSI.dat, which turns the modem's raw signal readings into dBm
+    pub rssi_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -98,6 +102,13 @@ pub struct Speech {
     pub speed: f32,
     #[serde(default = "default_speech_threads")]
     pub threads: i32,
+}
+
+// Answers an RF user who has finished transmitting with a short transmission of its own: an ACK, and how well they were heard
+#[derive(Deserialize, Clone)]
+pub struct Ack {
+    #[serde(default = "default_ack_delay_ms")]
+    pub delay_ms: u64,
 }
 
 // Lets other nodes find this one. The node's password is read from a file, to keep it out of the configuration
@@ -179,6 +190,7 @@ fn default_suffix() -> String { "ASL".to_string() }
 fn default_hosts_url() -> String { "https://raw.githubusercontent.com/g4klx/DStarGateway/master/Data/DStar_Hosts.json".to_string() }
 fn default_hosts_cache() -> PathBuf { PathBuf::from("/var/lib/va3ujf/DStar_Hosts.json") }
 fn default_hosts_refresh_hours() -> u64 { 72 }
+fn default_ack_delay_ms() -> u64 { 750 }
 fn default_baud() -> u32 { 115200 }
 fn default_tx_delay_ms() -> u32 { 100 }
 fn default_level() -> f32 { 50.0 }

@@ -58,7 +58,7 @@ mod tests {
 
     fn set_peer(shared: &Shared, connected: bool) {
         state::update(shared, |snapshot| {
-            let peers = if connected { vec![PeerStatus { id: "54321".into(), mode: "transceive", outbound: true, connected, keyed: false }] } else { Vec::new() };
+            let peers = if connected { vec![PeerStatus { id: "54321".into(), mode: "transceive", outbound: true, connected, keyed: false, talking: false }] } else { Vec::new() };
             state::link_mut(snapshot, "other", "other").peers = peers;
         });
     }

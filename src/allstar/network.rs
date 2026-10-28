@@ -156,7 +156,7 @@ mod tests {
     use crate::state::{LinkStatus, PeerStatus};
 
     fn peer(id: &str, mode: &'static str, connected: bool) -> PeerStatus {
-        PeerStatus { id: id.to_string(), mode, outbound: true, connected, keyed: false }
+        PeerStatus { id: id.to_string(), mode, outbound: true, connected, keyed: false, talking: false }
     }
 
     #[test]

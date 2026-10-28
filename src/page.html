@@ -4,33 +4,78 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{callsign}} hotspot</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <style>
-  :root { --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #667085; --line: #e3e6eb; --good: #1a7f37; --bad: #b42318; --accent: #2457d6; }
-  @media (prefers-color-scheme: dark) { :root { --bg: #111418; --card: #1a1e24; --text: #e8eaed; --muted: #98a2b3; --line: #2b313a; --good: #4cc26a; --bad: #f97066; --accent: #7a9cff; } }
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #667085; --line: #e3e6eb; --good: #1a7f37; --bad: #b42318; --accent: #2457d6; --talk: #fff4d6; --talk-line: #e0a100; --meter: #e3e6eb; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111418; --card: #1a1e24; --text: #e8eaed; --muted: #98a2b3; --line: #2b313a; --good: #4cc26a; --bad: #f97066; --accent: #7a9cff; --talk: #3a3114; --talk-line: #e0a100; --meter: #2b313a; } }
   body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
-  main { max-width: 760px; margin: 0 auto; padding: 16px; }
-  h1 { font-size: 20px; margin: 8px 0 16px; }
-  h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 8px 0 16px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  #connection { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--muted); }
+  #connection::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--bad); }
+  #connection.live::before { background: var(--good); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; }
   .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
   .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
   .row span:first-child { color: var(--muted); }
-  .good { color: var(--good); } .bad { color: var(--bad); }
+  .good { color: var(--good); } .bad { color: var(--bad); } .muted { color: var(--muted); }
   form { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
   select, input, button { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
   input { width: 3.5em; text-transform: uppercase; text-align: center; }
   button { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
   button.plain { background: var(--card); color: var(--text); border-color: var(--line); }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); }
+  th, td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
   th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  .scroll { overflow-x: auto; }
+  #flash { color: var(--bad); min-height: 1.4em; margin: 0 0 8px; }
+
+  .card.flush { padding: 0; overflow: hidden; }
+  #map { height: 320px; background: var(--line); }
+  #map .unavailable { padding: 16px; color: var(--muted); }
+  .leaflet-container { font: inherit; }
+  .peer-marker { transition: fill .2s; }
+  .peer-marker.talking { stroke: var(--talk-line); stroke-width: 4; fill: var(--talk-line); }
+
+  .meter { display: inline-block; vertical-align: middle; width: 120px; height: 10px; border-radius: 5px; background: var(--meter); overflow: hidden; }
+  .meter > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--good), var(--talk-line), var(--bad)); background-size: 120px 100%; transition: width .15s ease-out; }
+  #peers tbody tr { cursor: default; }
+  #peers tbody tr.has-fix { cursor: pointer; }
+  #peers tbody tr.talking { background: var(--talk); box-shadow: inset 3px 0 0 var(--talk-line); }
+  #peers tbody tr.offline { color: var(--muted); }
+  #peers td.data { font-family: ui-monospace, monospace; font-size: 13px; min-width: 21ch; white-space: pre; }
+  .caret { display: inline-block; width: .5em; margin-left: 1px; background: var(--talk-line); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #peers .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
+  #peers tr.talking .dot { background: var(--talk-line); animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  @media (prefers-reduced-motion: reduce) { #peers tr.talking .dot, .caret { animation: none; } }
+
+  #slowdata { max-height: 240px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 13px; }
+  #slowdata div { padding: 2px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; }
+  #slowdata time { color: var(--muted); flex: none; }
+  #slowdata b { flex: none; }
+  #slowdata .kind { flex: none; color: var(--muted); min-width: 6.5em; }
+  #slowdata span.value { white-space: pre-wrap; word-break: break-all; }
 </style>
 </head>
 <body>
 <main>
-  <h1>{{callsign}} <small>{{frequency}} MHz, module {{module}}</small></h1>
+  <h1>{{callsign}}<span id="connection">Connecting…</span></h1>
+  <div id="flash" role="alert"></div>
 
-  <div class="card"><h2>Now</h2><div id="now">Idle</div></div>
+  <div class="card flush"><div id="map"></div></div>
+
+  <div class="card">
+    <h2>Peers</h2>
+    <div class="scroll"><table id="peers"><thead><tr><th></th><th>Callsign</th><th>Via</th><th>Signal</th><th>BER</th><th>Data</th><th>Last heard</th><th>Talked</th></tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="card">
+    <h2>Slow data</h2>
+    <div id="slowdata"><div class="muted">Waiting for a transmission…</div></div>
+  </div>
 
   <div class="card">
     <h2>Reflector</h2>
@@ -57,49 +102,238 @@
     <table><tbody id="allstar-schedule"></tbody></table>
   </div>
 
-  <div class="card">
-    <h2>Services</h2>
-    <div class="row"><span>Modem</span><span id="modem">…</span></div>
-    <div id="vocoders"></div>
-    <div class="row"><span>APRS-IS</span><span id="aprs">…</span></div>
-    <div class="row"><span>AllStarLink registration</span><span id="registration">…</span></div>
-  </div>
-
-  <div class="card">
-    <h2>Last heard</h2>
-    <table><thead><tr><th>Time</th><th>Callsign</th><th>Via</th><th>Length</th></tr></thead><tbody id="heard"></tbody></table>
-  </div>
 </main>
 <script>
-  const sources = { rf: "RF", reflector: "Reflector", allstar: "AllStar", announcement: "Announcement" };
-  const sourceName = (source) => sources[source] ?? source;
-  const flag = (value, good, bad) => value === null ? "Off" : value ? `<span class="good">${good}</span>` : `<span class="bad">${bad}</span>`;
-  const text = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const STATION = { latitude: {{latitude}}, longitude: {{longitude}}, callsign: "{{callsign}}" };
+  const SOURCES = { rf: "RF", reflector: "Reflector", allstar: "AllStar node", announcement: "Announcement", ack: "Repeater" };
+  const SLOW_DATA_LINES = 80;
+  const SIGNAL_STALE_MS = 1500;
+  const DBM_RANGE = [-120, -40];
 
-  async function refresh() {
-    try {
-      const status = await (await fetch("/api/status")).json();
-      document.getElementById("now").innerHTML = status.current ? `<b>${text(status.current.callsign)}</b> via ${sourceName(status.current.source)}, ${status.current.seconds}s` : "Idle";
-      const link = status.links.find((candidate) => candidate.kind === "reflector") ?? { target: null };
-      document.getElementById("link").innerHTML = !link.target ? "Not linked" : link.connected ? `<span class="good">Linked to ${text(link.target)}</span>` : `<span class="bad">Linking ${text(link.target)}…</span>`;
-      document.getElementById("modem").innerHTML = status.modem_connected ? `<span class="good">Connected</span> ${text(status.modem_firmware)}` : '<span class="bad">Not responding</span>';
-      document.getElementById("vocoders").innerHTML = status.vocoders.map((vocoder) => `<div class="row"><span>Vocoder (${text(vocoder.name)})</span><span>${flag(vocoder.connected, "Connected", "Not reachable")}</span></div>`).join("");
-      document.getElementById("aprs").innerHTML = flag(status.aprs_connected, "Connected", "Disconnected");
-      const allstar = status.allstar;
-      document.getElementById("allstar-card").hidden = !allstar;
-      if (allstar) {
-        document.getElementById("allstar-node").textContent = allstar.node;
-        document.getElementById("registration").innerHTML = flag(allstar.registered, "Registered", "Not registered");
-        const peers = (status.links.find((candidate) => candidate.kind === "allstar") ?? { peers: [] }).peers;
-        const peerState = (peer) => !peer.connected ? "Connecting…" : peer.keyed ? "Keyed" : "Idle";
-        document.getElementById("allstar-links").innerHTML = peers.length ? peers.map((peer) => `<tr><td>${text(peer.id)}</td><td>${peer.mode}, ${peer.outbound ? "outbound" : "inbound"}</td><td>${peerState(peer)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(peer.id)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>';
-        document.getElementById("allstar-schedule").innerHTML = allstar.schedule.map((run) => `<tr><td>${text(run.name)}</td><td>${new Date(run.next_at * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</td></tr>`).join("");
-      }
-      document.getElementById("heard").innerHTML = status.heard.map((entry) => `<tr><td>${new Date(entry.started_at * 1000).toLocaleTimeString()}</td><td>${text(entry.callsign)}</td><td>${sourceName(entry.source)}</td><td>${entry.seconds}s</td></tr>`).join("");
-    } catch (error) { /* keep the last view while the hotspot restarts */ }
+  const sourceName = (source) => SOURCES[source] ?? source;
+  const text = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const byId = (id) => document.getElementById(id);
+
+  let snapshot = null;
+  let signal = null;
+
+  // ---- Time ----
+
+  const age = (seconds) => seconds < 5 ? "just now" : seconds < 60 ? `${seconds}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`;
+  const duration = (seconds) => seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  const secondsSince = (unix) => Math.max(0, Math.floor(Date.now() / 1000) - unix);
+
+  // ---- Signal ----
+
+  // Quiet is the left of the bar and loud is the right. A calibrated modem gives dBm to scale by. Otherwise the raw readings are scaled against the range heard so far
+  const rawRange = { low: Infinity, high: -Infinity };
+  const MIN_RAW_SPAN = 50;
+
+  function signalFill() {
+    if (!signal) return 0;
+    if (signal.dbm !== null) return Math.max(0, Math.min(1, (signal.dbm - DBM_RANGE[0]) / (DBM_RANGE[1] - DBM_RANGE[0])));
+    const span = rawRange.high - rawRange.low;
+    return span < MIN_RAW_SPAN ? 0.5 : (signal.raw - rawRange.low) / span;
   }
-  refresh();
-  setInterval(refresh, 2000);
+
+  const signalFresh = () => signal && Date.now() - signal.at <= SIGNAL_STALE_MS;
+
+  function signalHtml(show) {
+    if (!show || !signalFresh()) return '<span class="muted">—</span>';
+    return `<span class="meter" data-meter><i style="width:${(signalFill() * 100).toFixed(0)}%"></i></span>`;
+  }
+
+  // Move the bars that are already on the page, so they glide rather than being redrawn
+  function moveMeters() {
+    const meters = document.querySelectorAll("[data-meter] > i");
+    meters.forEach((bar) => { bar.style.width = `${(signalFill() * 100).toFixed(0)}%`; });
+    return meters.length > 0;
+  }
+
+  // ---- Map ----
+
+  const map = { instance: null, markers: new Map(), touched: false, repeater: null };
+
+  function startMap() {
+    if (!window.L) {
+      byId("map").innerHTML = '<div class="unavailable">The map needs to load Leaflet and OpenStreetMap tiles, which needs internet access.</div>';
+      return;
+    }
+    map.instance = L.map("map", { worldCopyJump: true }).setView([STATION.latitude, STATION.longitude], 10);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' }).addTo(map.instance);
+    map.repeater = L.circleMarker([STATION.latitude, STATION.longitude], { radius: 9, color: "#2457d6", fillColor: "#2457d6", fillOpacity: 0.9, weight: 3 }).addTo(map.instance).bindTooltip(STATION.callsign, { permanent: true, direction: "top", offset: [0, -8] });
+    map.instance.on("dragstart zoomstart", (event) => { if (event.originalEvent || event.type === "dragstart") map.touched = true; });
+  }
+
+  function placePeer(peer) {
+    if (!map.instance || !peer.fix) return;
+    const position = [peer.fix.latitude, peer.fix.longitude];
+    let marker = map.markers.get(peer.callsign);
+    if (!marker) {
+      marker = L.circleMarker(position, { radius: 7, color: "#b54708", fillColor: "#f79009", fillOpacity: 0.85, weight: 2, className: "peer-marker" }).addTo(map.instance);
+      marker.bindTooltip(peer.callsign, { direction: "top", offset: [0, -6] });
+      map.markers.set(peer.callsign, marker);
+      keepInView();
+    } else if (!marker.getLatLng().equals(position)) {
+      marker.setLatLng(position);
+      keepInView();
+    }
+    marker.setTooltipContent(`${peer.callsign}${peer.fix.comment ? " — " + peer.fix.comment : ""}`);
+    marker.getElement()?.classList.toggle("talking", peer.talking);
+  }
+
+  // Zoom out to take in everyone, unless someone has moved the map themselves
+  function keepInView() {
+    if (map.touched) return;
+    const points = [map.repeater.getLatLng(), ...[...map.markers.values()].map((marker) => marker.getLatLng())];
+    map.instance.fitBounds(L.latLngBounds(points), { padding: [40, 40], maxZoom: 12 });
+  }
+
+  // ---- Tickers ----
+
+  // Slow data text arrives a few characters at a time, so it's typed out rather than appearing all at once
+  const TICKER_STEP_MS = 35;
+  const tickers = new Map();
+
+  function syncTicker(peer) {
+    let ticker = tickers.get(peer.callsign);
+    if (!ticker) tickers.set(peer.callsign, ticker = { shown: peer.message, target: peer.message });
+
+    // A snapshot can lag behind the events, so it only wins when it isn't an older piece of what's already been heard
+    if (peer.message === "" || !ticker.target.startsWith(peer.message)) ticker.target = peer.message;
+    if (!ticker.target.startsWith(ticker.shown)) ticker.shown = "";
+    return ticker;
+  }
+
+  function tickerHtml(peer) {
+    const shown = syncTicker(peer).shown;
+    return `<span class="ticker-text">${text(shown)}</span>${peer.talking && peer.via !== "allstar" ? '<span class="caret">&nbsp;</span>' : ""}`;
+  }
+
+  setInterval(() => {
+    for (const [callsign, ticker] of tickers) {
+      if (ticker.shown === ticker.target) continue;
+      ticker.shown = ticker.target.slice(0, ticker.shown.length + 1);
+      const selector = `[data-ticker="${CSS.escape(callsign)}"]`;
+      document.querySelectorAll(selector).forEach((element) => { element.querySelector(".ticker-text").textContent = ticker.shown; });
+    }
+  }, TICKER_STEP_MS);
+
+  // ---- Peers ----
+
+  function renderPeers() {
+    const peers = [...snapshot.peers].sort((a, b) => b.talking - a.talking || b.last_heard - a.last_heard);
+    byId("peers").tBodies[0].innerHTML = peers.length ? peers.map((peer) => `<tr class="${peer.talking ? "talking" : ""}${peer.fix ? " has-fix" : ""}${peer.linked === false ? " offline" : ""}" data-callsign="${text(peer.callsign)}">
+      <td><span class="dot"></span></td>
+      <td><b>${text(peer.callsign)}</b></td>
+      <td>${sourceName(peer.via)}${peer.linked === false ? " (unlinked)" : ""}</td>
+      <td>${signalHtml(peer.talking && peer.via === "rf")}</td>
+      <td>${peer.ber_percent === null ? '<span class="muted">—</span>' : peer.ber_percent.toFixed(1) + "%"}</td>
+      <td class="data" data-ticker="${text(peer.callsign)}">${tickerHtml(peer)}</td>
+      <td data-last-heard="${peer.last_heard}">${peer.talking ? "talking" : age(secondsSince(peer.last_heard))}</td>
+      <td>${peer.transmissions}× · ${duration(peer.seconds)}</td></tr>`).join("") : '<tr><td></td><td class="muted" colspan="7">Nobody heard yet</td></tr>';
+    snapshot.peers.forEach(placePeer);
+  }
+
+  document.querySelector("#peers tbody").addEventListener("click", (event) => {
+    const peer = snapshot?.peers.find((candidate) => candidate.callsign === event.target.closest("tr")?.dataset.callsign);
+    if (peer?.fix && map.instance) { map.touched = true; map.instance.flyTo([peer.fix.latitude, peer.fix.longitude], Math.max(map.instance.getZoom(), 11)); }
+  });
+
+  // ---- Slow data ----
+
+  const textLines = new Map();
+
+  function slowData(event) {
+    if (event.kind === "text") {
+      const ticker = tickers.get(event.callsign);
+      if (ticker) ticker.target = event.text;
+    }
+    const log = byId("slowdata");
+    if (!log.querySelector("time")) log.innerHTML = "";
+    const stamp = new Date().toLocaleTimeString();
+
+    // A text message fills in as it arrives, so it's updated in place for as long as it's the latest thing from that station
+    const previous = event.kind === "text" ? textLines.get(event.callsign) : null;
+    if (previous && previous.parentNode === log && previous === log.firstElementChild) {
+      previous.querySelector("time").textContent = stamp;
+      previous.querySelector(".value").textContent = event.text;
+      return;
+    }
+    const line = document.createElement("div");
+    line.innerHTML = `<time>${stamp}</time><b>${text(event.callsign)}</b><span class="kind">${text(event.kind)}</span><span class="value">${text(event.text)}</span>`;
+    log.prepend(line);
+    if (event.kind === "text") textLines.set(event.callsign, line);
+    while (log.children.length > SLOW_DATA_LINES) log.lastElementChild.remove();
+  }
+
+  // ---- Everything else ----
+
+  function renderLinks() {
+    const reflector = snapshot.links.find((link) => link.kind === "reflector") ?? { target: null };
+    byId("link").innerHTML = !reflector.target ? "Not linked" : reflector.connected ? `<span class="good">Linked to ${text(reflector.target)}</span>` : `<span class="bad">Linking ${text(reflector.target)}…</span>`;
+    const allstar = snapshot.allstar;
+    byId("allstar-card").hidden = !allstar;
+    if (!allstar) return;
+    byId("allstar-node").textContent = allstar.node;
+    const peers = (snapshot.links.find((link) => link.kind === "allstar") ?? { peers: [] }).peers;
+    const peerState = (peer) => !peer.connected ? "Connecting…" : peer.keyed ? "Keyed" : "Idle";
+    byId("allstar-links").innerHTML = peers.length ? peers.map((peer) => `<tr><td>${text(peer.id)}</td><td>${peer.mode}, ${peer.outbound ? "outbound" : "inbound"}</td><td>${peerState(peer)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(peer.id)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>';
+    byId("allstar-schedule").innerHTML = allstar.schedule.map((run) => `<tr><td>${text(run.name)}</td><td>${new Date(run.next_at * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</td></tr>`).join("");
+  }
+
+  function render() {
+    renderPeers();
+    renderLinks();
+  }
+
+  function handle(message) {
+    switch (message.type) {
+      case "snapshot": snapshot = message.snapshot; render(); break;
+      case "signal":
+        signal = { raw: message.raw, dbm: message.dbm, at: Date.now() };
+        rawRange.low = Math.min(rawRange.low, message.raw);
+        rawRange.high = Math.max(rawRange.high, message.raw);
+        if (snapshot && !moveMeters()) renderPeers();
+        break;
+      case "slow_data": slowData(message); break;
+      case "position": {
+        const peer = snapshot?.peers.find((candidate) => candidate.callsign === message.callsign);
+        if (peer) { peer.fix = { latitude: message.latitude, longitude: message.longitude, comment: message.comment }; placePeer(peer); }
+        break;
+      }
+      case "quality": {
+        const peer = snapshot?.peers.find((candidate) => candidate.callsign === message.callsign);
+        if (peer) { peer.ber_percent = message.ber_percent; peer.dbm = message.dbm; renderPeers(); }
+        break;
+      }
+    }
+  }
+
+  // Forms act on the hotspot without leaving the page
+  document.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.target;
+    const response = await fetch(form.action, { method: "POST", body: new URLSearchParams(new FormData(form)) });
+    byId("flash").textContent = response.ok ? "" : await response.text();
+  });
+
+  // Keep times and the elapsed counter moving between updates
+  setInterval(() => {
+    document.querySelectorAll("[data-last-heard]").forEach((cell) => { if (!cell.parentElement.classList.contains("talking")) cell.textContent = age(secondsSince(Number(cell.dataset.lastHeard))); });
+    if (signal && !signalFresh() && snapshot) { signal = null; renderPeers(); }
+  }, 1000);
+
+  // The page stays live by reconnecting whenever the hotspot restarts or the network drops
+  function connect() {
+    const socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/live`);
+    socket.onopen = () => { byId("connection").textContent = "Live"; byId("connection").classList.add("live"); };
+    socket.onmessage = (event) => handle(JSON.parse(event.data));
+    socket.onclose = () => { byId("connection").textContent = "Reconnecting…"; byId("connection").classList.remove("live"); setTimeout(connect, 2000); };
+  }
+
+  startMap();
+  connect();
 </script>
 </body>
 </html>

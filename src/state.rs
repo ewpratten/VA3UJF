@@ -1,11 +1,15 @@
 // Live status of every part of the hotspot, shared with the web UI
 
+use crate::dprs::Fix;
+use crate::live::Event;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 const HEARD_HISTORY: usize = 15;
+const PEER_LIMIT: usize = 200;
+const EVENT_BACKLOG: usize = 256;
 
 // One party reachable through a link, such as a node linked into AllStar
 #[derive(Clone, Serialize)]
@@ -14,7 +18,10 @@ pub struct PeerStatus {
     pub mode: &'static str,
     pub outbound: bool,
     pub connected: bool,
+
+    // Either end is transmitting, as opposed to the peer itself talking
     pub keyed: bool,
+    pub talking: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -44,6 +51,35 @@ pub struct Transmission {
     pub callsign: String,
     pub started_at: u64,
     pub seconds: u64,
+
+    // Whether the sender is a station to keep in the peer list, rather than the repeater speaking for itself
+    #[serde(skip)]
+    pub tracked: bool,
+}
+
+// A station that's been heard
+#[derive(Clone, Serialize)]
+pub struct Peer {
+    pub callsign: String,
+    pub via: &'static str,
+    pub talking: bool,
+    pub last_heard: u64,
+    pub transmissions: u32,
+    pub seconds: u64,
+    pub fix: Option<Fix>,
+
+    // The latest text message sent along with its voice
+    pub message: String,
+
+    // How its last RF transmission measured up
+    pub ber_percent: Option<f32>,
+    pub dbm: Option<f32>,
+
+    // For peers reached through a link, whether the link has them right now. None for stations heard directly
+    pub linked: Option<bool>,
+
+    #[serde(skip)]
+    keyed_since: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -68,6 +104,7 @@ pub struct Snapshot {
     pub links: Vec<LinkStatus>,
     pub current: Option<Transmission>,
     pub heard: Vec<Transmission>,
+    pub peers: Vec<Peer>,
 
     // Management details that only AllStar has, beside its link
     pub allstar: Option<AllstarStatus>,
@@ -77,19 +114,33 @@ pub struct Snapshot {
     pub vocoders: Vec<VocoderStatus>,
 }
 
-// The snapshot has one writer at a time, and anything that needs to react to a change can subscribe to it
+// The snapshot has one writer at a time, and anything that needs to react to a change can subscribe to it. Events are for what's happening right now, and are gone once they've been seen
 #[derive(Clone)]
-pub struct Shared(Arc<watch::Sender<Snapshot>>);
+pub struct Shared(Arc<Inner>);
+
+struct Inner {
+    snapshot: watch::Sender<Snapshot>,
+    events: broadcast::Sender<Event>,
+}
 
 impl Default for Shared {
     fn default() -> Self {
-        Shared(Arc::new(watch::channel(Snapshot::default()).0))
+        Shared(Arc::new(Inner { snapshot: watch::channel(Snapshot::default()).0, events: broadcast::channel(EVENT_BACKLOG).0 }))
     }
 }
 
 impl Shared {
     pub fn subscribe(&self) -> watch::Receiver<Snapshot> {
-        self.0.subscribe()
+        self.0.snapshot.subscribe()
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+        self.0.events.subscribe()
+    }
+
+    // Nobody listening is fine
+    pub fn emit(&self, event: Event) {
+        let _ = self.0.events.send(event);
     }
 }
 
@@ -98,16 +149,72 @@ pub fn unix_now() -> u64 {
 }
 
 pub fn update(shared: &Shared, change: impl FnOnce(&mut Snapshot)) {
-    shared.0.send_modify(change);
+    shared.0.snapshot.send_modify(change);
 }
 
 pub fn read(shared: &Shared) -> Snapshot {
-    shared.0.borrow().clone()
+    shared.0.snapshot.borrow().clone()
+}
+
+// Room for one more peer, dropping the one that's been quiet longest if the list is full
+fn make_room_for_peer(snapshot: &mut Snapshot) {
+    if snapshot.peers.len() >= PEER_LIMIT
+        && let Some(oldest) = snapshot.peers.iter().enumerate().filter(|(_, peer)| !peer.talking).min_by_key(|(_, peer)| peer.last_heard).map(|(index, _)| index)
+    {
+        snapshot.peers.remove(oldest);
+    }
+}
+
+fn new_peer(callsign: &str, via: &'static str, linked: Option<bool>) -> Peer {
+    Peer { callsign: callsign.to_string(), via, talking: false, last_heard: unix_now(), transmissions: 0, seconds: 0, fix: None, message: String::new(), ber_percent: None, dbm: None, linked, keyed_since: None }
+}
+
+// A station keyed up, which adds it to the peer list if it's new
+pub fn peer_keyed_up(snapshot: &mut Snapshot, callsign: &str, via: &'static str) {
+    let now = unix_now();
+    if !snapshot.peers.iter().any(|peer| peer.callsign == callsign) {
+        make_room_for_peer(snapshot);
+        snapshot.peers.push(new_peer(callsign, via, None));
+    }
+    let peer = snapshot.peers.iter_mut().find(|peer| peer.callsign == callsign).expect("the peer was just added");
+    (peer.via, peer.talking, peer.last_heard, peer.transmissions, peer.message) = (via, true, now, peer.transmissions + 1, String::new());
+}
+
+// Keep the peers a link says it has in step with the peer list. These are only known by what the link reports, so it's their keying that's followed
+pub fn sync_link_peers(snapshot: &mut Snapshot, kind: &'static str, reported: &[PeerStatus]) {
+    let now = unix_now();
+    for status in reported {
+        if !snapshot.peers.iter().any(|peer| peer.callsign == status.id && peer.via == kind) {
+            make_room_for_peer(snapshot);
+            snapshot.peers.push(new_peer(&status.id, kind, Some(true)));
+        }
+    }
+    for peer in snapshot.peers.iter_mut().filter(|peer| peer.via == kind && peer.linked.is_some()) {
+        let status = reported.iter().find(|status| status.id == peer.callsign);
+        let (linked, talking) = status.map_or((false, false), |status| (status.connected, status.connected && status.talking));
+        peer.linked = Some(linked);
+        if talking && peer.keyed_since.is_none() {
+            (peer.keyed_since, peer.transmissions) = (Some(now), peer.transmissions + 1);
+        } else if !talking && let Some(since) = peer.keyed_since.take() {
+            peer.seconds += now.saturating_sub(since);
+        }
+        if talking || peer.talking {
+            peer.last_heard = now;
+        }
+        peer.talking = talking;
+    }
+}
+
+pub fn peer_mut<'a>(snapshot: &'a mut Snapshot, callsign: &str) -> Option<&'a mut Peer> {
+    snapshot.peers.iter_mut().find(|peer| peer.callsign == callsign)
 }
 
 pub fn finish_transmission(snapshot: &mut Snapshot) {
     if let Some(mut finished) = snapshot.current.take() {
         finished.seconds = unix_now().saturating_sub(finished.started_at);
+        if let Some(peer) = peer_mut(snapshot, &finished.callsign).filter(|_| finished.tracked) {
+            (peer.talking, peer.last_heard, peer.seconds) = (false, unix_now(), peer.seconds + finished.seconds);
+        }
         snapshot.heard.insert(0, finished);
         snapshot.heard.truncate(HEARD_HISTORY);
     }
@@ -138,4 +245,39 @@ pub fn set_vocoder(snapshot: &mut Snapshot, name: &'static str, connected: bool)
 // Whether anyone is keyed up on RF or through a link
 pub fn channel_is_quiet(snapshot: &Snapshot) -> bool {
     snapshot.current.is_none() && snapshot.links.iter().all(|link| link.peers.iter().all(|peer| !peer.keyed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(id: &str, connected: bool, talking: bool) -> PeerStatus {
+        PeerStatus { id: id.to_string(), mode: "transceive", outbound: true, connected, keyed: talking, talking }
+    }
+
+    #[test]
+    fn peers_reached_through_a_link_follow_what_the_link_reports() {
+        let mut snapshot = Snapshot::default();
+        sync_link_peers(&mut snapshot, "allstar", &[status("54321", true, false)]);
+        assert_eq!((snapshot.peers.len(), snapshot.peers[0].linked, snapshot.peers[0].talking), (1, Some(true), false));
+
+        // Keying up counts a transmission, and the peer is talking until it stops
+        sync_link_peers(&mut snapshot, "allstar", &[status("54321", true, true)]);
+        sync_link_peers(&mut snapshot, "allstar", &[status("54321", true, true)]);
+        assert_eq!((snapshot.peers[0].talking, snapshot.peers[0].transmissions), (true, 1));
+        sync_link_peers(&mut snapshot, "allstar", &[status("54321", true, false)]);
+        assert_eq!((snapshot.peers[0].talking, snapshot.peers[0].transmissions), (false, 1));
+
+        // A peer that's gone stays known, but isn't linked
+        sync_link_peers(&mut snapshot, "allstar", &[]);
+        assert_eq!((snapshot.peers.len(), snapshot.peers[0].linked), (1, Some(false)));
+    }
+
+    #[test]
+    fn stations_heard_directly_are_left_alone_by_a_links_sync() {
+        let mut snapshot = Snapshot::default();
+        peer_keyed_up(&mut snapshot, "N0TEST/ID51", "rf");
+        sync_link_peers(&mut snapshot, "allstar", &[]);
+        assert_eq!((snapshot.peers[0].talking, snapshot.peers[0].linked), (true, None));
+    }
 }

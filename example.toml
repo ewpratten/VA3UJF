@@ -13,6 +13,14 @@ longitude = -90.0
 [modem]
 port = "/dev/ttyS0"
 
+# Signal levels need firmware built with SEND_RSSI_DATA, and MMDVMHost's RSSI.dat to turn the modem's raw readings into dBm
+# rssi_file = "/etc/va3ujf/RSSI.dat"
+
+# Answers an RF user who lets go of the PTT with a short transmission of its own, like MMDVMHost's ack. It says "ACK BER 0.3% -87dBm",
+# with the dBm only if the modem reports signal levels. Left out, nobody is answered
+# [ack]
+# delay_ms = 750
+
 [aprs]
 server = "noam.aprs2.net:14580"
 
