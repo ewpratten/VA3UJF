@@ -1,12 +1,4 @@
-# Build from the repository root: docker build -f subprojects/apps/va3ujf/Dockerfile .
-FROM rust:1-slim-trixie AS planner
-WORKDIR /usr/src/va3ujf
-
-# The workspace lockfile covers every crate, so let cargo prune it to this one. That keeps the dependency layer cached across unrelated changes
-COPY subprojects/apps/va3ujf/Cargo.toml ./
-COPY Cargo.lock ./
-RUN mkdir src && touch src/main.rs && cargo metadata --format-version 1 > /dev/null
-
+# Build from the repository root: docker build .
 FROM rust:1-slim-trixie AS builder
 
 # The speech engine is a static C++ library, so linking needs a C++ toolchain
@@ -14,11 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /
 WORKDIR /usr/src/va3ujf
 
 # Build dependencies in their own layer so source changes don't rebuild them
-COPY --from=planner /usr/src/va3ujf/Cargo.toml /usr/src/va3ujf/Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
+COPY Cargo.toml ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
 
-COPY subprojects/apps/va3ujf/src ./src
-RUN touch src/main.rs && cargo build --release --locked
+COPY src ./src
+RUN touch src/main.rs && cargo build --release
 
 # The voice announcements are spoken in, with its checksum, so a changed download can't slip in
 FROM debian:trixie-slim AS voice
