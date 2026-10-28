@@ -1,6 +1,7 @@
 // Station configuration, read from a single TOML file
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Clone)]
@@ -55,19 +56,27 @@ pub struct Aprs {
     pub beacon_minutes: u64,
 }
 
-// Bridge between the hotspot and an AllStar node's USRP channel, vocoding through an AMBEserver
+// An AllStar node whose radio is the hotspot, linking to other nodes over IAX2 and vocoding through an AMBEserver
 #[derive(Deserialize, Clone)]
 pub struct Allstar {
     pub node: u32,
     pub ambeserver: String,
     #[serde(default, rename = "schedule")]
     pub schedule: Vec<ScheduleEntry>,
-    #[serde(default = "default_usrp_address")]
-    pub usrp_address: String,
-    #[serde(default = "default_usrp_listen_port")]
-    pub usrp_listen_port: u16,
-    #[serde(default = "default_usrp_send_port")]
-    pub usrp_send_port: u16,
+    #[serde(default = "default_iax_port")]
+    pub iax_port: u16,
+    #[serde(default = "default_dns_domain")]
+    pub dns_domain: String,
+
+    // Nodes reached at a fixed "host:port" instead of through DNS
+    #[serde(default)]
+    pub nodes: HashMap<String, String>,
+    pub registration: Option<Registration>,
+    pub statpost: Option<Statpost>,
+
+    // Step off the reflector while AllStar has links, and go back once they're gone
+    #[serde(default = "default_park_reflector")]
+    pub park_reflector: bool,
     #[serde(default = "default_suffix")]
     pub suffix: String,
     pub message: Option<String>,
@@ -75,6 +84,25 @@ pub struct Allstar {
     pub rx_gain_db: f32,
     #[serde(default)]
     pub tx_gain_db: f32,
+}
+
+// Lets other nodes find this one. The node's password is read from a file, to keep it out of the configuration
+#[derive(Deserialize, Clone)]
+pub struct Registration {
+    pub password_file: PathBuf,
+    #[serde(default = "default_registration_url")]
+    pub url: String,
+    #[serde(default = "default_registration_interval_seconds")]
+    pub interval_seconds: u64,
+}
+
+// Posts the node's links to AllStarLink's stats
+#[derive(Deserialize, Clone)]
+pub struct Statpost {
+    #[serde(default = "default_statpost_url")]
+    pub url: String,
+    #[serde(default = "default_statpost_interval_seconds")]
+    pub interval_seconds: u64,
 }
 
 // Links or unlinks AllStar nodes at cron times in the host's timezone, running its actions in order
@@ -95,8 +123,6 @@ pub struct Action {
     pub permanent: bool,
     #[serde(default)]
     pub monitor: bool,
-    #[serde(default)]
-    pub echolink: bool,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -125,9 +151,13 @@ pub struct Hosts {
     pub refresh_hours: u64,
 }
 
-fn default_usrp_address() -> String { "127.0.0.1".to_string() }
-fn default_usrp_listen_port() -> u16 { 34001 }
-fn default_usrp_send_port() -> u16 { 32001 }
+fn default_iax_port() -> u16 { 4569 }
+fn default_dns_domain() -> String { "nodes.allstarlink.org".to_string() }
+fn default_park_reflector() -> bool { true }
+fn default_registration_url() -> String { "https://register.allstarlink.org/".to_string() }
+fn default_registration_interval_seconds() -> u64 { 180 }
+fn default_statpost_url() -> String { "http://stats.allstarlink.org/uhandler".to_string() }
+fn default_statpost_interval_seconds() -> u64 { 60 }
 fn default_suffix() -> String { "ASL".to_string() }
 fn default_hosts_url() -> String { "https://raw.githubusercontent.com/g4klx/DStarGateway/master/Data/DStar_Hosts.json".to_string() }
 fn default_hosts_cache() -> PathBuf { PathBuf::from("/var/lib/va3ujf/DStar_Hosts.json") }

@@ -26,11 +26,22 @@ pub struct ScheduledRun {
     pub next_at: i64,
 }
 
+#[derive(Clone, Serialize)]
+pub struct AllstarLink {
+    pub node: String,
+    pub mode: &'static str,
+    pub outbound: bool,
+    pub connected: bool,
+    pub keyed: bool,
+}
+
 #[derive(Clone, Default, Serialize)]
 pub struct AllstarStatus {
     pub node: u32,
-    pub links: Vec<String>,
-    pub error: Option<String>,
+    pub links: Vec<AllstarLink>,
+
+    // None when the node isn't set up to register
+    pub registered: Option<bool>,
     pub schedule: Vec<ScheduledRun>,
 }
 

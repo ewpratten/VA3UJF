@@ -29,6 +29,17 @@ node = 12345
 ambeserver = "127.0.0.1:2460"
 message = "AllStar 12345"
 
+# Registering lets other nodes find this one. The node's password is read from the file, to keep it out of this one
+[allstar.registration]
+password_file = "/etc/va3ujf/allstar_password"
+
+# Posts the node's links to AllStarLink's stats page
+[allstar.statpost]
+
+# Nodes can be reached at a fixed address instead of through DNS, which also sets where each is expected to call in from
+# [allstar.nodes]
+# "54321" = "192.0.2.20:4569"
+
 # Cron times are in the host's timezone. Unlink specific nodes rather than "all", so a schedule never drops a link made by hand
 [[allstar.schedule]]
 name = "Weekly Net"

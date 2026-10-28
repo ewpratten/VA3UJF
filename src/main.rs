@@ -5,6 +5,8 @@ mod config;
 mod dprs;
 mod dstar;
 mod hosts;
+#[cfg(test)]
+mod integration;
 mod http;
 mod modem;
 mod reflector;
@@ -46,16 +48,30 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
         snapshot.allstar = config.allstar.as_ref().map(|allstar| state::AllstarStatus { node: allstar.node, ..Default::default() });
     });
 
+    // The node and the bridge trade audio directly, and the bridge trades D-STAR frames with the router
+    let mut allstar_handle = None;
     let bridge_endpoints = config.allstar.clone().map(|allstar| {
         let (bridge_to_router, from_bridge) = mpsc::channel(256);
         let (to_bridge, bridge_from_router) = mpsc::channel(256);
-        let station = config.station.clone();
-        let shared = shared.clone();
+        let (bridge_to_node, from_bridge_audio) = mpsc::channel(256);
+        let (node_to_bridge, bridge_from_node) = mpsc::channel(256);
+        let (handle, node_commands) = allstar::channel();
+        allstar_handle = Some(handle.clone());
+        let (station, bridge_shared, node_shared, schedule_shared) = (config.station.clone(), shared.clone(), shared.clone(), shared.clone());
+        let (bridge_config, node_config, schedule_config) = (allstar.clone(), allstar.clone(), allstar);
+        let reflector_commands = command_sender.clone();
+        let node_station = station.clone();
         tokio::spawn(async move {
-            if let Err(error) = bridge::run(allstar, station, shared, bridge_from_router, bridge_to_router).await {
+            if let Err(error) = bridge::run(bridge_config, station, bridge_shared, bridge_from_router, bridge_to_router, bridge_from_node, bridge_to_node).await {
                 log::error!("AllStar bridge failed: {error:#}");
             }
         });
+        tokio::spawn(async move {
+            if let Err(error) = allstar::run(node_config, node_station, node_shared, reflector_commands, from_bridge_audio, node_to_bridge, node_commands).await {
+                log::error!("AllStar node failed: {error:#}");
+            }
+        });
+        tokio::spawn(allstar::run_schedule(schedule_config, handle, schedule_shared));
         (from_bridge, to_bridge)
     });
 
@@ -66,14 +82,10 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
         tokio::spawn(aprs::run(config.station.clone(), aprs_config, shared.clone(), from_router));
         to_aprs
     });
-    if let Some(allstar_config) = config.allstar.clone() {
-        tokio::spawn(allstar::poll_links(allstar_config.node, shared.clone()));
-        tokio::spawn(allstar::run_schedule(allstar_config, shared.clone()));
-    }
     let http_config = config.clone();
     let http_shared = shared.clone();
     tokio::spawn(async move {
-        if let Err(error) = http::serve(http_config, directory, http_shared, command_sender).await {
+        if let Err(error) = http::serve(http_config, directory, http_shared, command_sender, allstar_handle).await {
             log::error!("Web UI failed: {error:#}");
         }
     });
