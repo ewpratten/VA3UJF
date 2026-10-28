@@ -24,5 +24,5 @@ COPY --from=builder /usr/src/va3ujf/target/release/va3ujf /usr/local/bin/va3ujf
 ENV TZ=America/Toronto
 
 # Runs as root to open the modem's serial device and write the host list cache
-EXPOSE 8080/tcp
+EXPOSE 8080/tcp 4569/udp
 ENTRYPOINT ["va3ujf"]

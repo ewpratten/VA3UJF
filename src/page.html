@@ -46,13 +46,11 @@
 
   <div class="card" id="allstar-card" hidden>
     <h2>AllStar node <span id="allstar-node"></span></h2>
-    <div id="allstar-error" class="bad"></div>
     <table><tbody id="allstar-links"></tbody></table>
     <form method="post" action="/allstar/link">
       <input name="node" placeholder="Node" style="width:6em" required aria-label="Node">
       <label><input type="checkbox" name="permanent" style="width:auto"> Permanent</label>
       <label><input type="checkbox" name="monitor" style="width:auto"> Monitor</label>
-      <label><input type="checkbox" name="echolink" style="width:auto"> EchoLink</label>
       <button>Link</button>
     </form>
     <h2 style="margin-top:14px">Schedule</h2>
@@ -64,6 +62,7 @@
     <div class="row"><span>Modem</span><span id="modem">…</span></div>
     <div class="row"><span>AllStar vocoder</span><span id="vocoder">…</span></div>
     <div class="row"><span>APRS-IS</span><span id="aprs">…</span></div>
+    <div class="row"><span>AllStarLink registration</span><span id="registration">…</span></div>
   </div>
 
   <div class="card">
@@ -89,8 +88,9 @@
       document.getElementById("allstar-card").hidden = !allstar;
       if (allstar) {
         document.getElementById("allstar-node").textContent = allstar.node;
-        document.getElementById("allstar-error").textContent = allstar.error || "";
-        document.getElementById("allstar-links").innerHTML = allstar.links.length ? allstar.links.map((node) => `<tr><td>${text(node)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(node)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>';
+        document.getElementById("registration").innerHTML = flag(allstar.registered, "Registered", "Not registered");
+        const linkState = (link) => !link.connected ? "Connecting…" : link.keyed ? "Keyed" : "Idle";
+        document.getElementById("allstar-links").innerHTML = allstar.links.length ? allstar.links.map((link) => `<tr><td>${text(link.node)}</td><td>${link.mode}, ${link.outbound ? "outbound" : "inbound"}</td><td>${linkState(link)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(link.node)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>';
         document.getElementById("allstar-schedule").innerHTML = allstar.schedule.map((run) => `<tr><td>${text(run.name)}</td><td>${new Date(run.next_at * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</td></tr>`).join("");
       }
       document.getElementById("heard").innerHTML = status.heard.map((entry) => `<tr><td>${new Date(entry.started_at * 1000).toLocaleTimeString()}</td><td>${text(entry.callsign)}</td><td>${sources[entry.source]}</td><td>${entry.seconds}s</td></tr>`).join("");

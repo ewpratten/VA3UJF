@@ -21,6 +21,7 @@ struct App {
     directory: Directory,
     shared: Shared,
     commands: mpsc::Sender<Command>,
+    allstar: Option<allstar::Handle>,
 }
 
 // Checkboxes are only sent when ticked
@@ -29,13 +30,11 @@ struct AllstarLinkForm {
     node: String,
     monitor: Option<String>,
     permanent: Option<String>,
-    echolink: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct AllstarUnlinkForm {
     node: String,
-    echolink: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -85,27 +84,27 @@ async fn unlink(State(app): State<App>) -> Redirect {
 }
 
 async fn allstar_action(app: &App, action: Action) -> Response {
-    let Some(allstar_config) = &app.config.allstar else { return (StatusCode::NOT_FOUND, "AllStar isn't configured").into_response() };
-    match allstar::step(&action) {
-        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
-        Ok(_) => match allstar::run_action(allstar_config.node, &action).await {
-            Ok(()) => Redirect::to("/").into_response(),
-            Err(error) => (StatusCode::BAD_GATEWAY, format!("{error:#}")).into_response(),
-        },
+    let Some(handle) = &app.allstar else { return (StatusCode::NOT_FOUND, "AllStar isn't configured").into_response() };
+    if let Err(error) = allstar::step(&action) {
+        return (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response();
+    }
+    match handle.run_action(&action).await {
+        Ok(()) => Redirect::to("/").into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, format!("{error:#}")).into_response(),
     }
 }
 
 async fn allstar_link(State(app): State<App>, Form(form): Form<AllstarLinkForm>) -> Response {
-    allstar_action(&app, Action { link: Some(form.node.trim().to_string()), monitor: form.monitor.is_some(), permanent: form.permanent.is_some(), echolink: form.echolink.is_some(), ..Action::default() }).await
+    allstar_action(&app, Action { link: Some(form.node.trim().to_string()), monitor: form.monitor.is_some(), permanent: form.permanent.is_some(), ..Action::default() }).await
 }
 
 async fn allstar_unlink(State(app): State<App>, Form(form): Form<AllstarUnlinkForm>) -> Response {
-    allstar_action(&app, Action { unlink: Some(form.node.trim().to_string()), echolink: form.echolink.is_some(), ..Action::default() }).await
+    allstar_action(&app, Action { unlink: Some(form.node.trim().to_string()), ..Action::default() }).await
 }
 
-pub async fn serve(config: Config, directory: Directory, shared: Shared, commands: mpsc::Sender<Command>) -> anyhow::Result<()> {
+pub async fn serve(config: Config, directory: Directory, shared: Shared, commands: mpsc::Sender<Command>, allstar: Option<allstar::Handle>) -> anyhow::Result<()> {
     let address = config.http_listen.clone().unwrap_or_else(|| "0.0.0.0:8080".to_string());
-    let app = Router::new().route("/", get(index)).route("/api/status", get(status)).route("/link", post(link)).route("/unlink", post(unlink)).route("/allstar/link", post(allstar_link)).route("/allstar/unlink", post(allstar_unlink)).with_state(App { config, directory, shared, commands });
+    let app = Router::new().route("/", get(index)).route("/api/status", get(status)).route("/link", post(link)).route("/unlink", post(unlink)).route("/allstar/link", post(allstar_link)).route("/allstar/unlink", post(allstar_unlink)).with_state(App { config, directory, shared, commands, allstar });
     let listener = tokio::net::TcpListener::bind(&address).await?;
     log::info!("Web UI on http://{address}");
     axum::serve(listener, app).await?;

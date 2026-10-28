@@ -1,5 +1,6 @@
-// Bridge between D-STAR voice and an AllStar node's USRP channel, vocoding through an AMBEserver
+// Bridge between D-STAR voice and the AllStar node's audio, vocoding through an AMBEserver
 
+use crate::allstar::Audio;
 use crate::config::{Allstar, Station};
 use crate::state::{self, Shared};
 use crate::dstar::{pad, Frame, Header, FRAMES_PER_SUPERFRAME};
@@ -25,14 +26,13 @@ const AMBE_PKT_PRODID: u8 = 0x30;
 const AMBE_PKT_RATEP: u8 = 0x0A;
 const AMBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-// USRP framing, as used by chan_usrp
-const USRP_HEADER_BYTES: usize = 32;
-const USRP_FRAME_BYTES: usize = 320;
+// One 20 ms frame of 8 kHz audio, as 16-bit samples
+const AUDIO_FRAME_BYTES: usize = 320;
 
 // Stream housekeeping
 const VOCODER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DSTAR_STREAM_TIMEOUT: Duration = Duration::from_secs(1);
-const USRP_STREAM_TIMEOUT: Duration = Duration::from_millis(300);
+const ALLSTAR_STREAM_TIMEOUT: Duration = Duration::from_millis(300);
 const ENCODER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 // AMBEserver forgets idle clients (60s by default), so the rate is re-sent well before that
@@ -120,9 +120,7 @@ struct Bridge {
     station: Station,
     to_gateway: mpsc::Sender<Frame>,
     shared: Shared,
-    usrp: UdpSocket,
-    usrp_destination: SocketAddr,
-    usrp_transmit_sequence: u32,
+    to_node: mpsc::Sender<Audio>,
     vocoder_address: SocketAddr,
     vocoder: Option<UdpSocket>,
     vocoder_last_attempt: Instant,
@@ -163,14 +161,8 @@ impl Bridge {
         }
     }
 
-    async fn send_usrp(&mut self, keyup: u32, audio: &[u8]) {
-        let mut packet = vec![0u8; USRP_HEADER_BYTES];
-        packet[0..4].copy_from_slice(b"USRP");
-        packet[4..8].copy_from_slice(&self.usrp_transmit_sequence.to_be_bytes());
-        packet[12..16].copy_from_slice(&keyup.to_be_bytes());
-        packet.extend(audio);
-        let _ = self.usrp.send_to(&packet, self.usrp_destination).await;
-        self.usrp_transmit_sequence = self.usrp_transmit_sequence.wrapping_add(1);
+    async fn send_to_node(&mut self, audio: Audio) {
+        let _ = self.to_node.send(audio).await;
     }
 
     // ---- D-STAR side ----
@@ -202,29 +194,22 @@ impl Bridge {
         log::info!("D-STAR -> AllStar: end of transmission");
         self.inbound_active = false;
         self.warned_no_vocoder_inbound = false;
-        self.send_usrp(0, &[]).await;
+        self.send_to_node(Audio::End).await;
     }
 
     // ---- AllStar side ----
 
-    async fn handle_usrp(&mut self, data: &[u8]) {
-        if data.len() < USRP_HEADER_BYTES || &data[0..4] != b"USRP" {
-            return;
-        }
-        let keyup = u32::from_be_bytes(data[12..16].try_into().unwrap());
-        let packet_type = u32::from_be_bytes(data[20..24].try_into().unwrap());
-        let audio = &data[USRP_HEADER_BYTES..];
-        if packet_type != 0 {
-            return;
-        }
-
-        // Unkey marks the end of the AllStar transmission
-        if keyup == 0 || audio.len() != USRP_FRAME_BYTES {
-            if self.outbound_active && self.outbound_ending_since.is_none() {
-                self.outbound_ending_since = Some(Instant::now());
+    async fn handle_node_audio(&mut self, audio: Audio) {
+        // The end marker closes the AllStar transmission
+        let audio = match audio {
+            Audio::Voice(audio) if audio.len() == AUDIO_FRAME_BYTES => audio,
+            _ => {
+                if self.outbound_active && self.outbound_ending_since.is_none() {
+                    self.outbound_ending_since = Some(Instant::now());
+                }
+                return;
             }
-            return;
-        }
+        };
 
         // D-STAR has the channel, so drop AllStar audio
         if self.inbound_active {
@@ -263,10 +248,10 @@ impl Bridge {
     async fn handle_vocoder(&mut self, data: &[u8]) {
         for (kind, payload) in split_vocoder_packets(data) {
             // Decoded speech heads to AllStar
-            if kind == AMBE_TYPE_SPEECH && payload.len() >= 2 + USRP_FRAME_BYTES {
-                let samples = apply_gain(payload[2..2 + USRP_FRAME_BYTES].chunks_exact(2).map(|pair| i16::from_be_bytes([pair[0], pair[1]])), self.receive_gain);
+            if kind == AMBE_TYPE_SPEECH && payload.len() >= 2 + AUDIO_FRAME_BYTES {
+                let samples = apply_gain(payload[2..2 + AUDIO_FRAME_BYTES].chunks_exact(2).map(|pair| i16::from_be_bytes([pair[0], pair[1]])), self.receive_gain);
                 let audio: Vec<u8> = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
-                self.send_usrp(1, &audio).await;
+                self.send_to_node(Audio::Voice(audio)).await;
 
             // Encoded AMBE heads to D-STAR
             } else if kind == AMBE_TYPE_CHANNEL && payload.len() >= 11 {
@@ -311,7 +296,7 @@ impl Bridge {
 
         // Close out an AllStar stream once it stops and the encoder has drained
         if self.outbound_active {
-            if self.outbound_ending_since.is_none() && now.duration_since(self.outbound_last_heard) > USRP_STREAM_TIMEOUT {
+            if self.outbound_ending_since.is_none() && now.duration_since(self.outbound_last_heard) > ALLSTAR_STREAM_TIMEOUT {
                 self.outbound_ending_since = Some(now);
             }
             if let Some(since) = self.outbound_ending_since {
@@ -328,11 +313,8 @@ impl Bridge {
 }
 
 // Run the bridge, taking D-STAR frames from the gateway and handing back AllStar-originated ones
-pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_gateway: mpsc::Receiver<Frame>, to_gateway: mpsc::Sender<Frame>) -> anyhow::Result<()> {
-    let usrp = UdpSocket::bind((allstar.usrp_address.as_str(), allstar.usrp_listen_port)).await.context("couldn't bind the USRP port")?;
-    let usrp_destination = lookup_host((allstar.usrp_address.as_str(), allstar.usrp_send_port)).await?.next().context("couldn't resolve the USRP address")?;
+pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_gateway: mpsc::Receiver<Frame>, to_gateway: mpsc::Sender<Frame>, mut from_node: mpsc::Receiver<Audio>, to_node: mpsc::Sender<Audio>) -> anyhow::Result<()> {
     let vocoder_address = lookup_host(allstar.ambeserver.as_str()).await?.next().context("couldn't resolve the AMBEserver address")?;
-    log::info!("Exchanging USRP audio via {}:{}->{}", allstar.usrp_address, allstar.usrp_listen_port, allstar.usrp_send_port);
 
     let now = Instant::now();
     let message = allstar.message.clone().unwrap_or_else(|| format!("{} via AllStar", station.callsign));
@@ -344,9 +326,7 @@ pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_ga
         station,
         to_gateway,
         shared,
-        usrp,
-        usrp_destination,
-        usrp_transmit_sequence: 0,
+        to_node,
         vocoder_address,
         vocoder: None,
         vocoder_last_attempt: now - VOCODER_RETRY_INTERVAL,
@@ -363,7 +343,6 @@ pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_ga
     };
 
     let mut tick = interval(Duration::from_millis(20));
-    let mut usrp_buffer = [0u8; 1024];
     let mut vocoder_buffer = [0u8; 2048];
     loop {
         let vocoder_ready = async {
@@ -373,12 +352,10 @@ pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_ga
             }
         };
         tokio::select! {
-            received = bridge.usrp.recv(&mut usrp_buffer) => {
-                if let Ok(length) = received {
-                    let data = usrp_buffer[..length].to_vec();
-                    bridge.handle_usrp(&data).await;
-                }
-            }
+            audio = from_node.recv() => match audio {
+                Some(audio) => bridge.handle_node_audio(audio).await,
+                None => return Ok(()),
+            },
             received = vocoder_ready => {
                 if let Ok(length) = received {
                     let data = vocoder_buffer[..length].to_vec();

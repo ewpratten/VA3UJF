@@ -1,0 +1,57 @@
+[General]
+Type=Hotspot
+Callsign=${GATEWAY_CALLSIGN}
+Address=0.0.0.0
+HBAddress=0.0.0.0
+HBPort=20010
+Latitude=45.0
+Longitude=-90.0
+Language=English_US
+
+[IRCDDB 1]
+Enabled=1
+Hostname=${IRCDDB_HOST}
+
+[Repeater 1]
+Enabled=1
+Band=B
+Callsign=${GATEWAY_CALLSIGN}
+Address=${REPEATER_ADDRESS}
+Port=${REPEATER_PORT}
+Type=HB
+Reflector=
+ReflectorAtStartup=false
+Frequency=446.5
+Offset=0
+RangeKm=5
+Latitude=45.0
+Longitude=-90.0
+
+[APRS]
+Enabled=0
+
+[Paths]
+Data=/usr/local/share/dstargateway.d/
+
+[Hosts Files]
+HostsFiles=/var/lib/dstargateway/
+CustomHostsfiles=/usr/local/share/dstargateway.d/hostfiles.d/
+
+[Log]
+DisplayLevel=1
+
+[Dextra]
+Enabled=1
+MaxDongles=5
+
+[D-Plus]
+Enabled=0
+
+[DCS]
+Enabled=0
+
+[XLX]
+Enabled=0
+
+[Remote Commands]
+Enabled=0
