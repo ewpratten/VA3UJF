@@ -3,15 +3,17 @@
 use crate::allstar;
 use crate::config::{Action, Config};
 use crate::hosts::{self, Directory};
+use crate::metrics::Metrics;
 use crate::reflector::Command;
 use crate::state::{self, Shared};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
@@ -28,6 +30,7 @@ struct App {
     shared: Shared,
     commands: mpsc::Sender<Command>,
     allstar: Option<allstar::Handle>,
+    metrics: Arc<Metrics>,
 }
 
 // Checkboxes are only sent when ticked
@@ -120,6 +123,12 @@ async fn live(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(move |socket| stream(app, socket))
 }
 
+// What Prometheus scrapes
+async fn metrics(State(app): State<App>) -> impl IntoResponse {
+    app.metrics.update(&state::read(&app.shared));
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], app.metrics.encode())
+}
+
 async fn link(State(app): State<App>, Form(form): Form<LinkForm>) -> Response {
     let module = form.module.trim().to_ascii_uppercase();
     let known = hosts::find(&app.directory, form.reflector.trim()).is_some();
@@ -157,12 +166,12 @@ async fn allstar_unlink(State(app): State<App>, Form(form): Form<AllstarUnlinkFo
 }
 
 fn routes(app: App) -> Router {
-    Router::new().route("/", get(index)).route("/api/status", get(status)).route("/live", get(live)).route("/link", post(link)).route("/unlink", post(unlink)).route("/allstar/link", post(allstar_link)).route("/allstar/unlink", post(allstar_unlink)).with_state(app)
+    Router::new().route("/", get(index)).route("/api/status", get(status)).route("/live", get(live)).route("/metrics", get(metrics)).route("/link", post(link)).route("/unlink", post(unlink)).route("/allstar/link", post(allstar_link)).route("/allstar/unlink", post(allstar_unlink)).with_state(app)
 }
 
-pub async fn serve(config: Config, directory: Directory, shared: Shared, commands: mpsc::Sender<Command>, allstar: Option<allstar::Handle>) -> anyhow::Result<()> {
+pub async fn serve(config: Config, directory: Directory, shared: Shared, commands: mpsc::Sender<Command>, allstar: Option<allstar::Handle>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
     let address = config.http_listen.clone().unwrap_or_else(|| "0.0.0.0:8080".to_string());
-    let app = routes(App { config, directory, shared, commands, allstar });
+    let app = routes(App { config, directory, shared, commands, allstar, metrics });
     let listener = tokio::net::TcpListener::bind(&address).await?;
     log::info!("Web UI on http://{address}");
     axum::serve(listener, app).await?;
@@ -193,7 +202,7 @@ mod tests {
         let (commands, _unused) = mpsc::channel(1);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = App { config, directory, shared: shared.clone(), commands, allstar: None };
+        let app = App { config, directory, shared: shared.clone(), commands, allstar: None, metrics: Arc::new(Metrics::new()) };
         tokio::spawn(async move { axum::serve(listener, routes(app)).await });
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/live")).await.unwrap();
 
@@ -225,9 +234,31 @@ mod tests {
     async fn the_page_knows_where_the_repeater_is() {
         let config: Config = toml::from_str("[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.25\nlongitude = -90.5\n[modem]\nport = \"/dev/null\"\n").unwrap();
         let directory = hosts::directory(&config);
-        let app = App { config, directory, shared: Shared::default(), commands: mpsc::channel(1).0, allstar: None };
+        let app = App { config, directory, shared: Shared::default(), commands: mpsc::channel(1).0, allstar: None, metrics: Arc::new(Metrics::new()) };
         let Html(page) = index(State(app)).await;
         assert!(page.contains("latitude: 45.25, longitude: -90.5"), "the repeater's position wasn't filled in");
         assert!(!page.contains("{{"), "a placeholder was left in the page");
+    }
+
+    #[tokio::test]
+    async fn prometheus_can_scrape_the_metrics_from_the_same_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let config: Config = toml::from_str("[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.25\nlongitude = -90.5\n[modem]\nport = \"/dev/null\"\n").unwrap();
+        let directory = hosts::directory(&config);
+        let shared = Shared::default();
+        state::update(&shared, |snapshot| snapshot.modem_connected = true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = App { config, directory, shared, commands: mpsc::channel(1).0, allstar: None, metrics: Arc::new(Metrics::new()) };
+        tokio::spawn(async move { axum::serve(listener, routes(app)).await });
+
+        let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+        connection.write_all(b"GET /metrics HTTP/1.1\r\nHost: hotspot\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        connection.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.to_lowercase().contains("content-type: text/plain; version=0.0.4"), "{response}");
+        assert!(response.contains("va3ujf_modem_connected 1"), "the status wasn't read at scrape time:\n{response}");
+        assert!(response.contains("# TYPE va3ujf_transmissions_total counter"), "{response}");
     }
 }

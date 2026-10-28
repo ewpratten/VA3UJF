@@ -12,6 +12,7 @@ mod integration;
 mod http;
 mod live;
 mod meter;
+mod metrics;
 mod modem;
 mod reflector;
 mod router;
@@ -43,6 +44,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
     let (mut router, radio) = router::Router::new();
     let (command_sender, command_receiver) = mpsc::channel(16);
     let shared = state::Shared::default();
+    let metrics = metrics::start(&shared);
     let directory = hosts::directory(&config);
     hosts::start(&config, &directory).await;
     state::update(&shared, |snapshot| snapshot.aprs_connected = config.aprs.as_ref().map(|_| false));
@@ -81,7 +83,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
     let http_config = config.clone();
     let http_shared = shared.clone();
     tokio::spawn(async move {
-        if let Err(error) = http::serve(http_config, directory, http_shared, command_sender, allstar_handle).await {
+        if let Err(error) = http::serve(http_config, directory, http_shared, command_sender, allstar_handle, metrics).await {
             log::error!("Web UI failed: {error:#}");
         }
     });
