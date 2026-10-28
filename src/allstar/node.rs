@@ -2,14 +2,16 @@
 
 use super::directory::{is_node_number, Directory};
 use super::iax2::{self, command, control, ie, Datagram, Event, FullFrame, Ies, Session, FORMAT_ULAW, PROTOCOL_VERSION};
-use super::{network, ulaw, Audio, Command, LinkMode};
+use super::mixer::{mix, Buffer, SAMPLES_PER_FRAME};
+use super::tokens::Tokens;
+use super::{network, Audio, Command, LinkMode};
+use audio_codec_algorithms::{decode_ulaw, encode_ulaw};
 use crate::config::{Allstar, Station};
 use crate::reflector;
 use crate::speech::{self, Speaker};
 use crate::state::{self, AllstarLink, Shared};
 use anyhow::Context;
-use std::collections::{HashSet, VecDeque};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +20,6 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 
 const TICK: Duration = Duration::from_millis(20);
-const SAMPLES_PER_FRAME: usize = 160;
 const MAX_INBOUND_LINKS: usize = 32;
 const MAX_RETRIES: u32 = 5;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -34,9 +35,6 @@ const LINK_LIST_SOON: Duration = Duration::from_millis(200);
 // A link that goes quiet without a key-up is treated as unkeyed after this long. App_rpt's own 50 ms assumes its jitter buffer
 const RX_LINGER: Duration = Duration::from_millis(300);
 const TALKER_TIMEOUT: Duration = Duration::from_millis(500);
-const PREFILL_FRAMES: usize = 2;
-const MAX_BUFFERED_FRAMES: usize = 10;
-const CALL_TOKEN_LIFETIME_SECONDS: u64 = 10;
 
 const NEWKEY: &str = "!NEWKEY!";
 const NEWKEY_ONE: &str = "!NEWKEY1!";
@@ -55,46 +53,6 @@ enum NewKey {
 enum Source {
     Link(usize),
     DStar,
-}
-
-// Audio from one source waits here until the mixer wants it, so network jitter doesn't turn into gaps
-#[derive(Default)]
-struct Buffer {
-    frames: VecDeque<Vec<i16>>,
-    playing: bool,
-}
-
-impl Buffer {
-    fn push(&mut self, frame: Vec<i16>) {
-        self.frames.push_back(frame);
-        if self.frames.len() > MAX_BUFFERED_FRAMES {
-            self.frames.pop_front();
-        }
-    }
-
-    // Playback starts once a little audio has built up, and carries on through gaps until the source is done and drained
-    fn next(&mut self, keyed: bool) -> Option<Vec<i16>> {
-        if !self.playing && (self.frames.len() >= PREFILL_FRAMES || (!keyed && !self.frames.is_empty())) {
-            self.playing = true;
-        }
-        if !self.playing {
-            return None;
-        }
-        let frame = self.frames.pop_front();
-        if self.frames.is_empty() && !keyed {
-            self.playing = false;
-        }
-        frame
-    }
-
-    fn active(&self, keyed: bool) -> bool {
-        keyed || self.playing || !self.frames.is_empty()
-    }
-}
-
-// Add audio together, clipping rather than wrapping
-fn mix(frames: &[&Vec<i16>]) -> Vec<i16> {
-    (0..SAMPLES_PER_FRAME).map(|index| frames.iter().map(|frame| frame.get(index).copied().unwrap_or(0) as i32).sum::<i32>().clamp(i16::MIN as i32, i16::MAX as i32) as i16).collect()
 }
 
 struct Link {
@@ -167,32 +125,6 @@ impl Link {
 enum Internal {
     Resolved { node: String, addresses: anyhow::Result<Vec<SocketAddr>> },
     Verified { address: SocketAddr, frame: FullFrame, calling: String, verdict: Result<(), String> },
-}
-
-// Call tokens prove a caller can receive at the address it claims, before any state is kept for it
-struct Tokens {
-    keys: std::collections::hash_map::RandomState,
-}
-
-impl Tokens {
-    fn tag(&self, address: SocketAddr, time: u64) -> u64 {
-        let mut hasher = self.keys.build_hasher();
-        address.hash(&mut hasher);
-        time.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    fn issue(&self, address: SocketAddr) -> Vec<u8> {
-        let time = state::unix_now();
-        format!("{time}?{:016x}", self.tag(address, time)).into_bytes()
-    }
-
-    fn valid(&self, token: &[u8], address: SocketAddr) -> bool {
-        let Some((time, tag)) = std::str::from_utf8(token).ok().and_then(|text| text.split_once('?')) else { return false };
-        let (Ok(time), Ok(tag)) = (time.parse::<u64>(), u64::from_str_radix(tag, 16)) else { return false };
-        let now = state::unix_now();
-        tag == self.tag(address, time) && time <= now && now - time < CALL_TOKEN_LIFETIME_SECONDS
-    }
 }
 
 struct Node {
@@ -714,7 +646,7 @@ impl Node {
         if !link.rx_keyed {
             return;
         }
-        link.rx_samples.extend(ulaw::decode_frame(payload));
+        link.rx_samples.extend(payload.iter().copied().map(decode_ulaw));
         while self.links[index].rx_samples.len() >= SAMPLES_PER_FRAME {
             let frame: Vec<i16> = self.links[index].rx_samples.drain(..SAMPLES_PER_FRAME).collect();
             self.links[index].rx_buffer.push(frame);
@@ -757,7 +689,7 @@ impl Node {
                 }
             }
             let frames: Vec<&Vec<i16>> = others.iter().filter_map(|(_, frame)| frame.as_ref()).collect();
-            session.send_voice(now, FORMAT_ULAW, &ulaw::encode_frame(&mix(&frames)));
+            session.send_voice(now, FORMAT_ULAW, &mix(&frames).into_iter().map(encode_ulaw).collect::<Vec<u8>>());
         }
 
         // The hotspot hears all the links, and is told when the last one stops
@@ -914,7 +846,7 @@ pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_
         dstar_heard: now,
         bridge_active: false,
         next_call: 1,
-        tokens: Tokens { keys: Default::default() },
+        tokens: Tokens::new(),
         verifying: HashSet::new(),
         parked_reflector: None,
     };
@@ -1009,35 +941,6 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(500), announcements.recv()).await.is_err(), "a disconnect was announced twice");
     }
 
-    #[test]
-    fn mixing_adds_audio_and_clips_instead_of_wrapping() {
-        let (quiet, loud) = (vec![1000i16; SAMPLES_PER_FRAME], vec![2000i16; SAMPLES_PER_FRAME]);
-        assert_eq!(mix(&[&quiet, &loud])[0], 3000);
-        let (high, low) = (vec![30000i16; SAMPLES_PER_FRAME], vec![-30000i16; SAMPLES_PER_FRAME]);
-        assert_eq!(mix(&[&high, &high])[0], i16::MAX);
-        assert_eq!(mix(&[&low, &low])[0], i16::MIN);
-        assert_eq!(mix(&[])[0], 0);
-    }
-
-    #[test]
-    fn a_buffer_waits_for_a_little_audio_then_drains_after_its_source_stops() {
-        let mut buffer = Buffer::default();
-        buffer.push(vec![1; SAMPLES_PER_FRAME]);
-        assert!(buffer.next(true).is_none(), "one frame isn't enough to start");
-        buffer.push(vec![2; SAMPLES_PER_FRAME]);
-        assert_eq!(buffer.next(true).unwrap()[0], 1);
-
-        // A gap while the source is still keyed is silence, and the buffer stays active
-        assert_eq!(buffer.next(true).unwrap()[0], 2);
-        assert!(buffer.next(true).is_none());
-        assert!(buffer.active(true));
-
-        // Once the source stops, what's left plays out and the buffer goes quiet
-        buffer.push(vec![3; SAMPLES_PER_FRAME]);
-        assert_eq!(buffer.next(false).unwrap()[0], 3);
-        assert!(!buffer.active(false));
-    }
-
     // A hub with two nodes linked to it. When both talk at once, the hub hears the mix, and each hears only the other
     #[tokio::test]
     async fn a_hub_mixes_simultaneous_talkers_and_hears_everyone_but_itself() {
@@ -1059,16 +962,5 @@ mod tests {
         assert!(steady(&heard_by_left, 2000) >= 30, "the first node should hear only the second: {heard_by_left:?}");
         assert!(steady(&heard_by_right, 1000) >= 30, "the second node should hear only the first: {heard_by_right:?}");
         assert!(heard_by_left.iter().all(|heard| *heard < 2500), "the first node heard more than the second: {heard_by_left:?}");
-    }
-
-    #[test]
-    fn call_tokens_only_work_for_the_address_they_were_issued_to() {
-        let tokens = Tokens { keys: Default::default() };
-        let (first, second): (SocketAddr, SocketAddr) = ("192.0.2.1:4569".parse().unwrap(), "192.0.2.2:4569".parse().unwrap());
-        let token = tokens.issue(first);
-        assert!(tokens.valid(&token, first));
-        assert!(!tokens.valid(&token, second));
-        assert!(!tokens.valid(b"garbage", first));
-        assert!(!tokens.valid(format!("{}?{:016x}", state::unix_now() - 60, 0).as_bytes(), first));
     }
 }

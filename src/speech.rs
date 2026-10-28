@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep, Instant};
+use tokio::time::{interval, sleep, timeout};
 
 const OUTPUT_RATE: u32 = 8000;
 const SAMPLES_PER_FRAME: usize = 160;
@@ -184,24 +184,22 @@ fn frames(samples: &[i16]) -> Vec<Vec<u8>> {
     samples.chunks(SAMPLES_PER_FRAME).map(|chunk| chunk.iter().copied().chain(std::iter::repeat(0)).take(SAMPLES_PER_FRAME).flat_map(i16::to_le_bytes).collect()).collect()
 }
 
-fn channel_is_quiet(shared: &Shared) -> bool {
-    let snapshot = state::read(shared);
-    snapshot.current.is_none() && snapshot.allstar.is_none_or(|allstar| allstar.links.iter().all(|link| !link.keyed))
+fn channel_is_quiet(snapshot: &Snapshot) -> bool {
+    snapshot.current.is_none() && snapshot.allstar.as_ref().is_none_or(|allstar| allstar.links.iter().all(|link| !link.keyed))
 }
 
 // Wait for whoever is talking to finish, so an announcement never talks over anyone
 async fn wait_for_quiet(shared: &Shared) -> bool {
-    let deadline = Instant::now() + QUIET_PATIENCE;
-    while Instant::now() < deadline {
-        if channel_is_quiet(shared) {
+    let mut snapshots = shared.subscribe();
+    let settled = async {
+        while snapshots.wait_for(channel_is_quiet).await.is_ok() {
             sleep(QUIET_SETTLE).await;
-            if channel_is_quiet(shared) {
-                return true;
+            if channel_is_quiet(&snapshots.borrow()) {
+                return;
             }
         }
-        sleep(Duration::from_millis(100)).await;
-    }
-    false
+    };
+    timeout(QUIET_PATIENCE, settled).await.is_ok()
 }
 
 // Speak each announcement in turn, handing the audio to the bridge at the pace it's heard

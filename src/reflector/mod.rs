@@ -1,16 +1,20 @@
 // Reflector links over DCS and DExtra, as an outgoing client of a single reflector at a time
 
+mod packets;
+
 use crate::config::{Config, Protocol, Reflector};
 use crate::hosts::{self, Directory};
 use crate::speech::{self, Speaker};
 use crate::state::{self, LinkStatus, Shared};
 use crate::dstar::{pad, Frame, Header, END_SLOW_DATA, FRAMES_PER_SUPERFRAME};
+use packets::{ConnectPacket, DcsLinkPacket, DcsPoll, DcsUnlinkPacket, DcsVoicePacket, DextraPoll, DsvtHeaderPacket, DsvtVoicePacket, END_AMBE, HEADER_SEQUENCE, LAST_FRAME_FLAG};
 use anyhow::{bail, Context};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
+use zerocopy::{FromBytes, IntoBytes};
 
 const DCS_PORT: u16 = 30051;
 const DEXTRA_PORT: u16 = 30001;
@@ -19,9 +23,6 @@ const DEXTRA_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const LINK_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(1);
-const END_AMBE: [u8; 9] = [0x55, 0x55, 0x55, 0x55, 0xC8, 0x7A, 0x00, 0x00, 0x00];
-const DCS_CONNECT_HTML: &str = "<table border=\"0\" width=\"95%\"><tr><td width=\"4%\"><img border=\"0\" src=hotspot.jpg></td><td width=\"96%\"><font size=\"2\"><b>HOTSPOT</b> va3ujf</font></td></tr></table>";
-
 pub enum Command {
     Link { name: String, module: char },
     Unlink,
@@ -58,38 +59,27 @@ impl Active {
         format!("{} {}", self.reflector.name, self.module as char)
     }
 
-    // The 11 byte connect/unlink prefix both protocols share: station callsign, local module, remote module, NUL
-    fn connect_prefix(&self, config: &Config, remote_module: u8) -> Vec<u8> {
-        let mut packet = pad::<8>(&config.station.callsign).to_vec();
-        packet[7] = b' ';
-        packet.extend([config.station.module.as_bytes()[0], remote_module, 0]);
-        packet
-    }
-
     fn connect_packet(&self, config: &Config, unlink: bool) -> Vec<u8> {
         let remote_module = if unlink { b' ' } else { self.module };
-        let mut packet = self.connect_prefix(config, remote_module);
-        if self.protocol() == Protocol::Dcs {
-            packet.extend(pad::<8>(&self.reflector.name));
-            if !unlink {
-                let mut html = DCS_CONNECT_HTML.as_bytes().to_vec();
-                html.resize(500, 0);
-                packet.extend(html);
-            }
+        let connect = ConnectPacket::new(&config.station.callsign, config.station.module.as_bytes()[0], remote_module);
+        match (self.protocol(), unlink) {
+            (Protocol::Dextra, _) => connect.as_bytes().to_vec(),
+            (Protocol::Dcs, true) => DcsUnlinkPacket { connect, reflector: pad(&self.reflector.name) }.as_bytes().to_vec(),
+            (Protocol::Dcs, false) => DcsLinkPacket::new(DcsUnlinkPacket { connect, reflector: pad(&self.reflector.name) }).as_bytes().to_vec(),
         }
-        packet
     }
 
     fn poll_packet(&self, config: &Config) -> Vec<u8> {
-        let mut own = pad::<8>(&config.station.callsign);
-        own[7] = config.station.module.as_bytes()[0];
+        let mut callsign = pad::<8>(&config.station.callsign);
+        callsign[7] = config.station.module.as_bytes()[0];
+        let poll = DextraPoll { callsign, terminator: 0 };
         match self.protocol() {
             Protocol::Dcs => {
                 let mut reflector = pad::<8>(&self.reflector.name);
                 reflector[7] = self.module;
-                [&own[..], &[0], &reflector[..]].concat()
+                DcsPoll { poll, reflector }.as_bytes().to_vec()
             }
-            Protocol::Dextra => [&own[..], &[0]].concat(),
+            Protocol::Dextra => poll.as_bytes().to_vec(),
         }
     }
 
@@ -115,22 +105,10 @@ async fn open(directory: &Directory, name: &str, module: char) -> anyhow::Result
 
 fn transmit_voice(active: &Active, streams: &mut Streams, ambe: [u8; 9], slow_data: [u8; 3], end: bool) -> Option<Vec<u8>> {
     let header = streams.transmit_header.as_ref()?;
-    let sequence = if end { streams.transmit_sequence | 0x40 } else { streams.transmit_sequence };
+    let sequence = if end { streams.transmit_sequence | LAST_FRAME_FLAG } else { streams.transmit_sequence };
     let packet = match active.protocol() {
-        Protocol::Dextra => [b"DSVT\x20\x00\x00\x00\x20\x00\x00\x00", &streams.transmit_id.to_le_bytes()[..], &[sequence], &ambe, &slow_data].concat(),
-        Protocol::Dcs => {
-            let mut packet = vec![0u8; 100];
-            packet[0..4].copy_from_slice(b"0001");
-            packet[4..43].copy_from_slice(&header.body());
-            packet[43..45].copy_from_slice(&streams.transmit_id.to_le_bytes());
-            packet[45] = sequence;
-            packet[46..55].copy_from_slice(&ambe);
-            packet[55..58].copy_from_slice(&slow_data);
-            packet[58..61].copy_from_slice(&streams.transmit_count.to_le_bytes()[..3]);
-            packet[61] = 0x01;
-            packet[63] = 0x21;
-            packet
-        }
+        Protocol::Dextra => DsvtVoicePacket::new(streams.transmit_id, sequence, ambe, slow_data).as_bytes().to_vec(),
+        Protocol::Dcs => DcsVoicePacket::new(*header, streams.transmit_id, sequence, ambe, slow_data, streams.transmit_count).as_bytes().to_vec(),
     };
     streams.transmit_sequence = (streams.transmit_sequence + 1) % FRAMES_PER_SUPERFRAME;
     streams.transmit_count += 1;
@@ -148,7 +126,7 @@ async fn transmit(active: &Active, config: &Config, streams: &mut Streams, frame
             streams.transmit_sequence = 0;
             streams.transmit_count = 0;
             if active.protocol() == Protocol::Dextra {
-                let packet = [b"DSVT\x10\x00\x00\x00\x20\x00\x00\x00", &streams.transmit_id.to_le_bytes()[..], &[0x80], &header.to_bytes()].concat();
+                let packet = DsvtHeaderPacket::new(streams.transmit_id, header).as_bytes().to_vec();
                 for _ in 0..2 {
                     active.send(&packet).await;
                 }
@@ -207,19 +185,20 @@ async fn receive(active: &mut Active, config: &Config, streams: &mut Streams, pa
 
     // Voice, as (stream id, header, sequence, ambe, slow data)
     let parsed = match active.protocol() {
-        Protocol::Dextra if packet.starts_with(b"DSVT") && length == 56 && packet[14] == 0x80 => {
-            Some((u16::from_le_bytes([packet[12], packet[13]]), Header::from_body(&packet[15..54]), 0x80, [0; 9], [0; 3]))
-        }
-        Protocol::Dextra if packet.starts_with(b"DSVT") && length == 27 => {
-            Some((u16::from_le_bytes([packet[12], packet[13]]), None, packet[14], packet[15..24].try_into()?, packet[24..27].try_into()?))
-        }
-        Protocol::Dcs if packet.starts_with(b"0001") && length == 100 => {
-            Some((u16::from_le_bytes([packet[43], packet[44]]), Header::from_body(&packet[4..43]), packet[45], packet[46..55].try_into()?, packet[55..58].try_into()?))
-        }
-        _ => None,
+        Protocol::Dextra => match DsvtHeaderPacket::read_from_bytes(packet) {
+            Ok(dsvt) if dsvt.prefix.is_valid() && dsvt.prefix.sequence == HEADER_SEQUENCE => Some((dsvt.prefix.stream_id.get(), Some(dsvt.header.header), HEADER_SEQUENCE, [0; 9], [0; 3])),
+            _ => match DsvtVoicePacket::read_from_bytes(packet) {
+                Ok(dsvt) if dsvt.prefix.is_valid() => Some((dsvt.prefix.stream_id.get(), None, dsvt.prefix.sequence, dsvt.ambe, dsvt.slow_data)),
+                _ => None,
+            },
+        },
+        Protocol::Dcs => match DcsVoicePacket::read_from_bytes(packet) {
+            Ok(dcs) if dcs.is_valid() => Some((dcs.stream_id.get(), Some(dcs.header), dcs.sequence, dcs.ambe, dcs.slow_data)),
+            _ => None,
+        },
     };
     let Some((stream_id, header, sequence, ambe, slow_data)) = parsed else { return Ok(()) };
-    if sequence == 0x80 {
+    if sequence == HEADER_SEQUENCE {
         return Ok(forward_header(streams, stream_id, header, from_reflector).await);
     }
 
@@ -228,7 +207,7 @@ async fn receive(active: &mut Active, config: &Config, streams: &mut Streams, pa
         forward_header(streams, stream_id, header, from_reflector).await;
     }
     streams.receive_last = Some(Instant::now());
-    if sequence & 0x40 != 0 {
+    if sequence & LAST_FRAME_FLAG != 0 {
         streams.receive_id = None;
         streams.receive_last = None;
         from_reflector.send(Frame::End).await?;

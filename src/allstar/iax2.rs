@@ -3,6 +3,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::Instant;
+use zerocopy::byteorder::{BigEndian, U16, U32};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 pub const FORMAT_ULAW: u64 = 1 << 2;
 pub const PROTOCOL_VERSION: u16 = 2;
@@ -54,7 +56,6 @@ pub mod ie {
     pub const FORMAT2: u8 = 56;
 }
 
-const FULL_HEADER_BYTES: usize = 12;
 const FULL_FLAG: u16 = 0x8000;
 const RETRANSMISSION_FLAG: u16 = 0x8000;
 const SUBCLASS_LOG_FLAG: u8 = 0x80;
@@ -104,42 +105,64 @@ fn compress_subclass(subclass: u64) -> u8 {
     }
 }
 
+// The first bit of a datagram says whether it's a full frame, and the first bit of the destination call whether it's a retransmission
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(C)]
+struct FullHeader {
+    source_call: U16<BigEndian>,
+    dest_call: U16<BigEndian>,
+    timestamp: U32<BigEndian>,
+    oseq: u8,
+    iseq: u8,
+    frame_type: u8,
+    subclass: u8,
+}
+
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(C)]
+struct MiniHeader {
+    source_call: U16<BigEndian>,
+    timestamp: U16<BigEndian>,
+}
+
 impl FullFrame {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(FULL_HEADER_BYTES + self.payload.len());
-        bytes.extend((self.source_call | FULL_FLAG).to_be_bytes());
-        bytes.extend((self.dest_call | if self.retransmission { RETRANSMISSION_FLAG } else { 0 }).to_be_bytes());
-        bytes.extend(self.timestamp.to_be_bytes());
-        bytes.extend([self.oseq, self.iseq, self.frame_type, compress_subclass(self.subclass)]);
-        bytes.extend(&self.payload);
-        bytes
+        let header = FullHeader {
+            source_call: (self.source_call | FULL_FLAG).into(),
+            dest_call: (self.dest_call | if self.retransmission { RETRANSMISSION_FLAG } else { 0 }).into(),
+            timestamp: self.timestamp.into(),
+            oseq: self.oseq,
+            iseq: self.iseq,
+            frame_type: self.frame_type,
+            subclass: compress_subclass(self.subclass),
+        };
+        [header.as_bytes(), &self.payload].concat()
     }
 }
 
 // Full frames carry the full header, mini frames are voice with the low half of the timestamp. Meta frames (trunks, video) aren't used by node links
 pub fn parse(data: &[u8]) -> Option<Datagram> {
-    let first = u16::from_be_bytes(data.get(0..2)?.try_into().ok()?);
+    let first = U16::<BigEndian>::read_from_prefix(data).ok()?.0.get();
     if first & FULL_FLAG != 0 {
-        if data.len() < FULL_HEADER_BYTES {
-            return None;
-        }
-        let second = u16::from_be_bytes(data[2..4].try_into().ok()?);
+        let (header, payload) = FullHeader::read_from_prefix(data).ok()?;
+        let dest_call = header.dest_call.get();
         return Some(Datagram::Full(FullFrame {
             source_call: first & !FULL_FLAG,
-            dest_call: second & !RETRANSMISSION_FLAG,
-            retransmission: second & RETRANSMISSION_FLAG != 0,
-            timestamp: u32::from_be_bytes(data[4..8].try_into().ok()?),
-            oseq: data[8],
-            iseq: data[9],
-            frame_type: data[10],
-            subclass: uncompress_subclass(data[11]),
-            payload: data[FULL_HEADER_BYTES..].to_vec(),
+            dest_call: dest_call & !RETRANSMISSION_FLAG,
+            retransmission: dest_call & RETRANSMISSION_FLAG != 0,
+            timestamp: header.timestamp.get(),
+            oseq: header.oseq,
+            iseq: header.iseq,
+            frame_type: header.frame_type,
+            subclass: uncompress_subclass(header.subclass),
+            payload: payload.to_vec(),
         }));
     }
-    if first == 0 || data.len() < 4 {
+    if first == 0 {
         return None;
     }
-    Some(Datagram::Mini { source_call: first, timestamp: u16::from_be_bytes(data[2..4].try_into().ok()?), payload: data[4..].to_vec() })
+    let (header, payload) = MiniHeader::read_from_prefix(data).ok()?;
+    Some(Datagram::Mini { source_call: first, timestamp: header.timestamp.get(), payload: payload.to_vec() })
 }
 
 // Information elements: a type byte, a length byte, then the value
@@ -417,8 +440,8 @@ impl Session {
         let upper = timestamp & 0xFFFF_0000;
         let mini = format == self.sent_voice_format && (upper == previous & 0xFFFF_0000 || upper == previous.wrapping_add(0x1_0000) & 0xFFFF_0000);
         if mini {
-            let bytes = [&self.local_call.to_be_bytes()[..], &(timestamp as u16).to_be_bytes(), payload].concat();
-            self.outbox.push(bytes);
+            let header = MiniHeader { source_call: self.local_call.into(), timestamp: (timestamp as u16).into() };
+            self.outbox.push([header.as_bytes(), payload].concat());
             return;
         }
         self.sent_voice_format = format;

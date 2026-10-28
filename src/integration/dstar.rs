@@ -3,11 +3,12 @@
 
 use super::{build_image, container_assets, containers_available, Container, Network};
 use crate::config::Config;
-use crate::dstar::{pad, Frame, Header};
+use crate::dstar::{pad, Frame, Header, HeaderWithCrc};
 use crate::reflector::{self, Command};
 use crate::speech::Announcement;
 use crate::{hosts, state};
 use std::time::Duration;
+use zerocopy::{FromBytes, IntoBytes};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -20,7 +21,7 @@ const FRAMES: usize = 20;
 
 // Homebrew repeater protocol, as MMDVMHost speaks it to the gateway
 fn homebrew_header(header: &Header) -> Vec<u8> {
-    [&b"DSRP"[..], &[0x20, 0x12, 0x34, 0], &header.to_bytes()].concat()
+    [&b"DSRP"[..], &[0x20, 0x12, 0x34, 0], header.with_crc().as_bytes()].concat()
 }
 
 fn homebrew_voice(sequence: u8, end: bool, ambe: [u8; 9], slow_data: [u8; 3]) -> Vec<u8> {
@@ -43,7 +44,7 @@ async fn receive_homebrew(socket: &UdpSocket, patience: Duration) -> (Option<Hea
     while let Ok(Ok(length)) = tokio::time::timeout(patience, socket.recv(&mut buffer)).await {
         let packet = &buffer[..length];
         match packet.get(4) {
-            Some(0x20) if length >= 47 => header = Header::from_body(&packet[8..47]),
+            Some(0x20) if length >= 47 => header = HeaderWithCrc::read_from_prefix(&packet[8..]).ok().map(|(framed, _)| framed.header),
             Some(0x21) if length >= 21 && packet[7] & 0x40 == 0 => voice.push((packet[9..18].try_into().unwrap(), packet[18..21].try_into().unwrap())),
             Some(0x21) => break,
             _ => {}
