@@ -84,3 +84,34 @@ pub async fn heard_frames(receiver: &mut mpsc::Receiver<Audio>, patience: Durati
     }
     None
 }
+
+// A frame of one steady level, so what comes out of a mix can be checked by its size
+pub fn constant_frame(level: i16) -> Vec<u8> {
+    pcm_to_bytes(&[level; SAMPLES_PER_FRAME])
+}
+
+pub async fn transmit_level(sender: &mpsc::Sender<Audio>, level: i16, frames: usize) {
+    for _ in 0..frames {
+        sender.send(Audio::Voice(constant_frame(level))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    sender.send(Audio::End).await.unwrap();
+}
+
+// The levels heard during one transmission, as the average of each frame
+pub async fn heard_levels(receiver: &mut mpsc::Receiver<Audio>, patience: Duration) -> Vec<i32> {
+    let mut levels = Vec::new();
+    let deadline = Instant::now() + patience;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(600), receiver.recv()).await {
+            Ok(Some(Audio::Voice(bytes))) => {
+                let samples: Vec<i32> = bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as i32).collect();
+                levels.push(samples.iter().sum::<i32>() / samples.len() as i32);
+            }
+            Ok(Some(Audio::End)) => break,
+            _ if !levels.is_empty() => break,
+            _ => {}
+        }
+    }
+    levels
+}

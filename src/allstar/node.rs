@@ -7,7 +7,7 @@ use crate::config::{Allstar, Station};
 use crate::reflector;
 use crate::state::{self, AllstarLink, Shared};
 use anyhow::Context;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,6 +33,8 @@ const LINK_LIST_SOON: Duration = Duration::from_millis(200);
 // A link that goes quiet without a key-up is treated as unkeyed after this long. App_rpt's own 50 ms assumes its jitter buffer
 const RX_LINGER: Duration = Duration::from_millis(300);
 const TALKER_TIMEOUT: Duration = Duration::from_millis(500);
+const PREFILL_FRAMES: usize = 2;
+const MAX_BUFFERED_FRAMES: usize = 10;
 const CALL_TOKEN_LIFETIME_SECONDS: u64 = 10;
 
 const NEWKEY: &str = "!NEWKEY!";
@@ -47,11 +49,51 @@ enum NewKey {
     AllowedRedundant,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-enum Talker {
-    Nobody,
-    Link(String),
+// Where audio in the mix comes from. Links are named by their place in the list for the length of one mixing pass
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Source {
+    Link(usize),
     DStar,
+}
+
+// Audio from one source waits here until the mixer wants it, so network jitter doesn't turn into gaps
+#[derive(Default)]
+struct Buffer {
+    frames: VecDeque<Vec<i16>>,
+    playing: bool,
+}
+
+impl Buffer {
+    fn push(&mut self, frame: Vec<i16>) {
+        self.frames.push_back(frame);
+        if self.frames.len() > MAX_BUFFERED_FRAMES {
+            self.frames.pop_front();
+        }
+    }
+
+    // Playback starts once a little audio has built up, and carries on through gaps until the source is done and drained
+    fn next(&mut self, keyed: bool) -> Option<Vec<i16>> {
+        if !self.playing && (self.frames.len() >= PREFILL_FRAMES || (!keyed && !self.frames.is_empty())) {
+            self.playing = true;
+        }
+        if !self.playing {
+            return None;
+        }
+        let frame = self.frames.pop_front();
+        if self.frames.is_empty() && !keyed {
+            self.playing = false;
+        }
+        frame
+    }
+
+    fn active(&self, keyed: bool) -> bool {
+        keyed || self.playing || !self.frames.is_empty()
+    }
+}
+
+// Add audio together, clipping rather than wrapping
+fn mix(frames: &[&Vec<i16>]) -> Vec<i16> {
+    (0..SAMPLES_PER_FRAME).map(|index| frames.iter().map(|frame| frame.get(index).copied().unwrap_or(0) as i32).sum::<i32>().clamp(i16::MIN as i32, i16::MAX as i32) as i16).collect()
 }
 
 struct Link {
@@ -74,6 +116,7 @@ struct Link {
     rx_last_heard: Instant,
     rx_refresh_deadline: Option<Instant>,
     rx_samples: Vec<i16>,
+    rx_buffer: Buffer,
     tx_keyed: bool,
     tx_refreshed: Instant,
     remote_list: String,
@@ -102,6 +145,7 @@ impl Link {
             rx_last_heard: now,
             rx_refresh_deadline: None,
             rx_samples: Vec::new(),
+            rx_buffer: Buffer::default(),
             tx_keyed: false,
             tx_refreshed: now,
             remote_list: String::new(),
@@ -159,8 +203,10 @@ struct Node {
     to_bridge: mpsc::Sender<Audio>,
     reflector_commands: mpsc::Sender<reflector::Command>,
     links: Vec<Link>,
-    talker: Talker,
-    talker_heard: Instant,
+    dstar_buffer: Buffer,
+    dstar_keyed: bool,
+    dstar_heard: Instant,
+    bridge_active: bool,
     next_call: u16,
     tokens: Tokens,
     verifying: HashSet<(SocketAddr, u16)>,
@@ -338,9 +384,6 @@ impl Node {
         // A node calling again replaces its stale link
         if let Some(index) = self.index_of(node) {
             let mut old = self.links.remove(index);
-            if self.talker == Talker::Link(node.to_string()) {
-                self.end_talker(now);
-            }
             if let Some(old_session) = old.session.as_mut() {
                 old_session.hangup(now, "Replaced by a new link");
                 for bytes in old_session.take_outbox() {
@@ -407,9 +450,6 @@ impl Node {
 
     fn close(&mut self, node: &str, now: Instant) {
         let Some(index) = self.index_of(node) else { return };
-        if self.talker == Talker::Link(node.to_string()) {
-            self.end_talker(now);
-        }
         let link = &mut self.links[index];
         link.up = false;
         link.hangup_at = None;
@@ -644,15 +684,12 @@ impl Node {
         }
     }
 
-    fn rx_unkey(&mut self, node: &str, now: Instant) {
+    fn rx_unkey(&mut self, node: &str, _now: Instant) {
         let Some(index) = self.index_of(node) else { return };
         if self.links[index].rx_keyed {
             self.links[index].rx_keyed = false;
             self.links[index].rx_samples.clear();
             log::info!("AllStar: node {node} unkeyed");
-            if self.talker == Talker::Link(node.to_string()) {
-                self.end_talker(now);
-            }
             self.publish();
         }
     }
@@ -671,84 +708,70 @@ impl Node {
         link.rx_samples.extend(ulaw::decode_frame(payload));
         while self.links[index].rx_samples.len() >= SAMPLES_PER_FRAME {
             let frame: Vec<i16> = self.links[index].rx_samples.drain(..SAMPLES_PER_FRAME).collect();
-            self.route_link_audio(node, &frame, now);
+            self.links[index].rx_buffer.push(frame);
         }
     }
 
     // ---- Audio ----
 
-    // Whoever keys first holds the channel until they finish, as on the hotspot
-    fn take_channel(&mut self, talker: Talker, now: Instant) -> bool {
-        if self.talker == Talker::Nobody {
-            self.talker = talker.clone();
+    // One pass of the mixer: every source that's talking gives up a frame, and each destination gets all of them but its own
+    fn mix_tick(&mut self, now: Instant) {
+        let mut sources: Vec<(Source, Option<Vec<i16>>)> = Vec::new();
+        for (index, link) in self.links.iter_mut().enumerate() {
+            let keyed = link.rx_keyed;
+            let frame = link.rx_buffer.next(keyed);
+            if link.rx_buffer.active(keyed) {
+                sources.push((Source::Link(index), frame));
+            }
         }
-        let holds = self.talker == talker;
-        if holds {
-            self.talker_heard = now;
+        let dstar_frame = self.dstar_buffer.next(self.dstar_keyed);
+        if self.dstar_buffer.active(self.dstar_keyed) {
+            sources.push((Source::DStar, dstar_frame));
         }
-        holds
-    }
 
-    fn route_link_audio(&mut self, source: &str, frame: &[i16], now: Instant) {
-        if !self.take_channel(Talker::Link(source.to_string()), now) {
-            return;
-        }
-        let _ = self.to_bridge.try_send(Audio::Voice(pcm_to_bytes(frame)));
-        self.broadcast(frame, Some(source), now);
-    }
-
-    fn route_dstar_audio(&mut self, frame: &[i16], now: Instant) {
-        if self.take_channel(Talker::DStar, now) {
-            self.broadcast(frame, None, now);
-        }
-    }
-
-    // Send audio to every transceive link but the one it came from
-    fn broadcast(&mut self, frame: &[i16], except: Option<&str>, now: Instant) {
-        let bytes = ulaw::encode_frame(frame);
-        for link in &mut self.links {
-            if !link.up || link.mode != LinkMode::Transceive || except == Some(link.node.as_str()) {
+        // Each transceive link hears everyone else, and is keyed for as long as someone else is talking
+        for (index, link) in self.links.iter_mut().enumerate() {
+            let Some(session) = link.session.as_mut().filter(|_| link.up && link.mode == LinkMode::Transceive) else { continue };
+            let others: Vec<&(Source, Option<Vec<i16>>)> = sources.iter().filter(|(source, _)| *source != Source::Link(index)).collect();
+            if others.is_empty() {
+                if link.tx_keyed {
+                    link.tx_keyed = false;
+                    session.send_control(now, control::RADIO_UNKEY);
+                    session.send_cng(now);
+                }
                 continue;
             }
-            let Some(session) = link.session.as_mut() else { continue };
             if !link.tx_keyed {
                 (link.tx_keyed, link.tx_refreshed) = (true, now);
                 if link.newkey != NewKey::NotAllowed {
                     session.send_control(now, control::RADIO_KEY);
                 }
             }
-            session.send_voice(now, FORMAT_ULAW, &bytes);
+            let frames: Vec<&Vec<i16>> = others.iter().filter_map(|(_, frame)| frame.as_ref()).collect();
+            session.send_voice(now, FORMAT_ULAW, &ulaw::encode_frame(&mix(&frames)));
         }
-    }
 
-    // The talker is done. Links that were being sent audio get an unkey, and the bridge an end marker if the audio came from a link
-    fn end_talker(&mut self, now: Instant) {
-        if let Talker::Link(_) = self.talker {
-            let _ = self.to_bridge.try_send(Audio::End);
-        }
-        self.talker = Talker::Nobody;
-        for link in &mut self.links {
-            if link.tx_keyed {
-                link.tx_keyed = false;
-                if let Some(session) = link.session.as_mut() {
-                    session.send_control(now, control::RADIO_UNKEY);
-                    session.send_cng(now);
-                }
+        // The hotspot hears all the links, and is told when the last one stops
+        let link_frames: Vec<&Vec<i16>> = sources.iter().filter(|(source, _)| matches!(source, Source::Link(_))).filter_map(|(_, frame)| frame.as_ref()).collect();
+        if sources.iter().any(|(source, _)| matches!(source, Source::Link(_))) {
+            self.bridge_active = true;
+            if !link_frames.is_empty() {
+                let _ = self.to_bridge.try_send(Audio::Voice(pcm_to_bytes(&mix(&link_frames))));
             }
+        } else if self.bridge_active {
+            self.bridge_active = false;
+            let _ = self.to_bridge.try_send(Audio::End);
         }
     }
 
     fn handle_bridge_audio(&mut self, audio: Audio, now: Instant) {
         match audio {
             Audio::Voice(bytes) => {
-                let frame: Vec<i16> = bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
-                self.route_dstar_audio(&frame, now);
+                self.dstar_keyed = true;
+                self.dstar_heard = now;
+                self.dstar_buffer.push(bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect());
             }
-            Audio::End => {
-                if self.talker == Talker::DStar {
-                    self.end_talker(now);
-                }
-            }
+            Audio::End => self.dstar_keyed = false,
         }
     }
 
@@ -782,9 +805,10 @@ impl Node {
         for node in nodes {
             self.tick_link(&node, now);
         }
-        if self.talker == Talker::DStar && now.duration_since(self.talker_heard) > TALKER_TIMEOUT {
-            self.end_talker(now);
+        if self.dstar_keyed && now.duration_since(self.dstar_heard) > TALKER_TIMEOUT {
+            self.dstar_keyed = false;
         }
+        self.mix_tick(now);
     }
 
     fn tick_link(&mut self, node: &str, now: Instant) {
@@ -874,8 +898,10 @@ pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_
         to_bridge,
         reflector_commands,
         links: Vec::new(),
-        talker: Talker::Nobody,
-        talker_heard: now,
+        dstar_buffer: Buffer::default(),
+        dstar_keyed: false,
+        dstar_heard: now,
+        bridge_active: false,
         next_call: 1,
         tokens: Tokens { keys: Default::default() },
         verifying: HashSet::new(),
@@ -910,7 +936,7 @@ pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allstar::testing::*;
+    use crate::allstar::testing::{has_no_links, heard_frames, heard_levels, linked, start_node, transmit, transmit_level, wait_for};
 
     #[test]
     fn listed_modes_are_downgraded_through_weaker_links() {
@@ -931,16 +957,68 @@ mod tests {
         // Audio from the first node's bridge reaches the second node's bridge, and the transmission ends cleanly
         transmit(&first.to_node, 30).await;
         let heard = heard_frames(&mut second.from_node, Duration::from_secs(3)).await.expect("the transmission to end");
-        assert!((25..=30).contains(&heard), "second node heard {heard} of 30 frames");
+        assert!((25..=35).contains(&heard), "second node heard {heard} of 30 frames");
 
         // And back the other way, over the same link
         transmit(&second.to_node, 30).await;
         let heard = heard_frames(&mut first.from_node, Duration::from_secs(3)).await.expect("the transmission to end");
-        assert!((25..=30).contains(&heard), "first node heard {heard} of 30 frames");
+        assert!((25..=35).contains(&heard), "first node heard {heard} of 30 frames");
 
         // Unlinking from one end drops it at both
         first.handle.run_action(&crate::config::Action { unlink: Some("10002".into()), ..Default::default() }).await.unwrap();
         wait_for("both nodes to drop the link", || has_no_links(&first) && has_no_links(&second)).await;
+    }
+
+    #[test]
+    fn mixing_adds_audio_and_clips_instead_of_wrapping() {
+        let (quiet, loud) = (vec![1000i16; SAMPLES_PER_FRAME], vec![2000i16; SAMPLES_PER_FRAME]);
+        assert_eq!(mix(&[&quiet, &loud])[0], 3000);
+        let (high, low) = (vec![30000i16; SAMPLES_PER_FRAME], vec![-30000i16; SAMPLES_PER_FRAME]);
+        assert_eq!(mix(&[&high, &high])[0], i16::MAX);
+        assert_eq!(mix(&[&low, &low])[0], i16::MIN);
+        assert_eq!(mix(&[])[0], 0);
+    }
+
+    #[test]
+    fn a_buffer_waits_for_a_little_audio_then_drains_after_its_source_stops() {
+        let mut buffer = Buffer::default();
+        buffer.push(vec![1; SAMPLES_PER_FRAME]);
+        assert!(buffer.next(true).is_none(), "one frame isn't enough to start");
+        buffer.push(vec![2; SAMPLES_PER_FRAME]);
+        assert_eq!(buffer.next(true).unwrap()[0], 1);
+
+        // A gap while the source is still keyed is silence, and the buffer stays active
+        assert_eq!(buffer.next(true).unwrap()[0], 2);
+        assert!(buffer.next(true).is_none());
+        assert!(buffer.active(true));
+
+        // Once the source stops, what's left plays out and the buffer goes quiet
+        buffer.push(vec![3; SAMPLES_PER_FRAME]);
+        assert_eq!(buffer.next(false).unwrap()[0], 3);
+        assert!(!buffer.active(false));
+    }
+
+    // A hub with two nodes linked to it. When both talk at once, the hub hears the mix, and each hears only the other
+    #[tokio::test]
+    async fn a_hub_mixes_simultaneous_talkers_and_hears_everyone_but_itself() {
+        let mut hub = start_node(10010, 24572, &[(10011, "127.0.0.1:24571".into()), (10012, "127.0.0.1:24573".into())]);
+        let mut left = start_node(10011, 24571, &[(10010, "127.0.0.1:24572".into())]);
+        let mut right = start_node(10012, 24573, &[(10010, "127.0.0.1:24572".into())]);
+        for node in ["10011", "10012"] {
+            hub.handle.run_action(&crate::config::Action { link: Some(node.into()), ..Default::default() }).await.unwrap();
+        }
+        wait_for("both nodes to link to the hub", || linked(&hub, "10011") && linked(&hub, "10012") && linked(&left, "10010") && linked(&right, "10010")).await;
+
+        // Both talk together, at different levels, and the hub's bridge hears the sum
+        tokio::join!(transmit_level(&left.to_node, 1000, 50), transmit_level(&right.to_node, 2000, 50));
+        let (heard_by_hub, heard_by_left, heard_by_right) = (heard_levels(&mut hub.from_node, Duration::from_secs(3)).await, heard_levels(&mut left.from_node, Duration::from_secs(3)).await, heard_levels(&mut right.from_node, Duration::from_secs(3)).await);
+        let steady = |levels: &[i32], level: i32| levels.iter().filter(|heard| (**heard - level).abs() < level / 10).count();
+        assert!(steady(&heard_by_hub, 3000) >= 30, "the hub should hear the mix of both: {heard_by_hub:?}");
+
+        // Neither hears itself, only the other through the hub
+        assert!(steady(&heard_by_left, 2000) >= 30, "the first node should hear only the second: {heard_by_left:?}");
+        assert!(steady(&heard_by_right, 1000) >= 30, "the second node should hear only the first: {heard_by_right:?}");
+        assert!(heard_by_left.iter().all(|heard| *heard < 2500), "the first node heard more than the second: {heard_by_left:?}");
     }
 
     #[test]
