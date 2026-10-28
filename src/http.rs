@@ -78,6 +78,13 @@ async fn stream(app: App, mut socket: WebSocket) {
     let mut events = app.shared.subscribe_events();
     let mut batch = interval(SNAPSHOT_INTERVAL);
     let mut changed = true;
+
+    // Where voice has been going lately, which events then keep up to date
+    let oldest = state::unix_now().saturating_sub(state::TRAFFIC_WINDOW_SECONDS);
+    let history: Vec<state::Transmission> = state::read(&app.shared).history.into_iter().filter(|transmission| transmission.started_at + transmission.seconds >= oldest).collect();
+    if socket.send(Message::Text(serde_json::json!({ "type": "history", "transmissions": history }).to_string().into())).await.is_err() {
+        return;
+    }
     loop {
         let message = tokio::select! {
             result = snapshots.changed() => {
@@ -190,7 +197,9 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, routes(app)).await });
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/live")).await.unwrap();
 
-        // The status comes first
+        // The recent traffic comes first, and then the status
+        let history = next_json(&mut socket).await;
+        assert_eq!((history["type"].as_str(), history["transmissions"].as_array().map(Vec::len)), (Some("history"), Some(0)));
         let first = next_json(&mut socket).await;
         assert_eq!((first["type"].as_str(), first["snapshot"]["modem_connected"].as_bool()), (Some("snapshot"), Some(false)));
 

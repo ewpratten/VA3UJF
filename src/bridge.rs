@@ -338,9 +338,21 @@ mod tests {
         let header = Header { flags: [0; 3], repeater_2: pad("N0CALL G"), repeater_1: pad("N0CALL B"), your_call: pad("CQCQCQ"), my_call: pad("N0TEST"), my_suffix: pad("") };
         to_bridge.send(Frame::Header(header)).await.unwrap();
         to_bridge.send(Frame::Voice { sequence: 0, ambe: [1; 9], slow_data: [0; 3] }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
         to_bridge.send(Frame::End).await.unwrap();
 
-        // The fake vocoder only encodes, so what's checked is the end of the transmission reaching the audio side
-        assert!(matches!(tokio::time::timeout(Duration::from_secs(2), audio_out.recv()).await, Ok(Some(Audio::End))));
+        // The voice comes out as audio, and the end of the transmission follows it
+        let mut voice = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), audio_out.recv()).await {
+                Ok(Some(Audio::Voice(samples))) => {
+                    assert_eq!(samples, vec![crate::codec::ambe::FAKE_SPEECH_LEVEL; SAMPLES_PER_FRAME]);
+                    voice += 1;
+                }
+                Ok(Some(Audio::End)) => break,
+                other => panic!("the transmission never ended: {other:?}"),
+            }
+        }
+        assert_eq!(voice, 1);
     }
 }

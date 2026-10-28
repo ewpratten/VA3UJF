@@ -8,6 +8,7 @@ pub mod ulaw;
 pub const SAMPLES_PER_FRAME: usize = 160;
 
 // Audio between a link and the bridge that vocodes it: one frame of samples at a time, then an end marker
+#[derive(Debug)]
 pub enum Audio {
     Voice(Vec<i16>),
     End,
