@@ -15,8 +15,8 @@ RUN touch src/main.rs && cargo build --release
 # The voice announcements are spoken in, with its checksum, so a changed download can't slip in
 FROM debian:trixie-slim AS voice
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl bzip2 && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-medium-int8.tar.bz2 -o voice.tar.bz2 \
-    && echo "f1c6d0295cf16087b05f80fdca5b44daca5cd78e2c425d419a42ba34929805f9  voice.tar.bz2" | sha256sum -c - \
+RUN curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-low.tar.bz2 -o voice.tar.bz2 \
+    && echo "8fb427b8637334072ee5723d72fa418c45bfdd4b7deebeacdf2938662618c1cb  voice.tar.bz2" | sha256sum -c - \
     && mkdir /voice && tar -xjf voice.tar.bz2 --strip-components=1 -C /voice
 
 FROM gcr.io/distroless/cc-debian13

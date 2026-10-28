@@ -11,8 +11,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 // The voice the hotspot ships with, which the Dockerfile fetches the same way
-const VOICE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-medium-int8.tar.bz2";
-const VOICE_SHA256: &str = "f1c6d0295cf16087b05f80fdca5b44daca5cd78e2c425d419a42ba34929805f9";
+const VOICE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-low.tar.bz2";
+const VOICE_SHA256: &str = "8fb427b8637334072ee5723d72fa418c45bfdd4b7deebeacdf2938662618c1cb";
 const VOICE_DIRECTORY_VARIABLE: &str = "VA3UJF_VOICE_DIRECTORY";
 
 fn run(program: &str, arguments: &[&str]) -> anyhow::Result<String> {
@@ -26,7 +26,7 @@ fn download_voice() -> anyhow::Result<PathBuf> {
     static DOWNLOADING: Mutex<()> = Mutex::new(());
     let _downloading = DOWNLOADING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let cache = std::env::temp_dir().join(format!("va3ujf-test-voice-{}", &VOICE_SHA256[..12]));
-    let voice = cache.join("vits-piper-en_US-lessac-medium-int8");
+    let voice = cache.join("vits-piper-en_US-lessac-low");
     if voice.join("tokens.txt").is_file() {
         return Ok(voice);
     }

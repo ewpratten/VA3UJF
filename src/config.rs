@@ -164,7 +164,7 @@ pub struct Hosts {
 
 fn default_voice_directory() -> PathBuf { PathBuf::from("/usr/share/va3ujf/voice") }
 fn default_speech_speed() -> f32 { 1.0 }
-fn default_speech_threads() -> i32 { 2 }
+fn default_speech_threads() -> i32 { 4 }
 fn default_iax_port() -> u16 { 4569 }
 fn default_dns_domain() -> String { "nodes.allstarlink.org".to_string() }
 fn default_park_reflector() -> bool { true }
