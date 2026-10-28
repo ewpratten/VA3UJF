@@ -100,6 +100,17 @@ impl Router {
                 }
             };
 
+            // Local-only voice, like an announcement, is cut off by anyone else keying up
+            if let (Frame::Header(_), Some((holder, _))) = (&frame, active)
+                && holder != sender
+                && members[holder].scope == Scope::LocalOnly
+            {
+                log::info!("Cutting off {} for someone keying up", members[holder].kind);
+                deliver(&members, holder, &Frame::End).await;
+                state::update(&shared, state::finish_transmission);
+                active = None;
+            }
+
             // Whoever keys up first holds the channel until they finish
             let holds_channel = match (&frame, active) {
                 (Frame::Header(_), None) => true,
@@ -255,6 +266,31 @@ mod tests {
         transmit(&radio.to_router, "CQCQCQ").await;
         assert!(heard_header(&mut link).await);
         assert!(heard_nothing(&mut announcer).await, "the announcer was sent a transmission");
+    }
+
+    #[tokio::test]
+    async fn an_announcement_is_cut_off_when_anyone_else_keys_up() {
+        let (mut router, mut radio) = Router::new();
+        let link = router.attach("link", Scope::Everyone);
+        let announcer = router.attach("announcement", Scope::LocalOnly);
+        tokio::spawn(router.run(RadioTaps::default(), Shared::default()));
+
+        announcer.to_router.send(Frame::Header(header("CQCQCQ"))).await.unwrap();
+        announcer.to_router.send(Frame::Voice { sequence: 0, ambe: [1; 9], slow_data: [2; 3] }).await.unwrap();
+        assert!(heard_header(&mut radio).await);
+        link.to_router.send(Frame::Header(header("CQCQCQ"))).await.unwrap();
+
+        // The announcement is ended for the radio, then the conversation comes through, and the rest of the announcement is dropped
+        let mut heard = Vec::new();
+        while heard.len() < 3 {
+            match tokio::time::timeout(Duration::from_secs(2), radio.from_router.recv()).await {
+                Ok(Some(frame)) => heard.push(frame),
+                _ => break,
+            }
+        }
+        assert!(matches!(heard.as_slice(), [Frame::Voice { .. }, Frame::End, Frame::Header(_)]), "{heard:?}");
+        announcer.to_router.send(Frame::Voice { sequence: 1, ambe: [1; 9], slow_data: [2; 3] }).await.unwrap();
+        assert!(heard_nothing(&mut radio).await, "the announcement carried on over the conversation");
     }
 
     #[tokio::test]
