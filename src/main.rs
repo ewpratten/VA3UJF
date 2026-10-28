@@ -1,3 +1,4 @@
+mod ack;
 mod allstar;
 mod aprs;
 mod bridge;
@@ -9,9 +10,11 @@ mod hosts;
 #[cfg(test)]
 mod integration;
 mod http;
+mod live;
 mod modem;
 mod reflector;
 mod router;
+mod slowdata;
 mod speech;
 mod state;
 
@@ -50,6 +53,9 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
         Some(speech::start(speech, ambeserver, tx_gain_db, config.station.clone(), shared.clone(), &mut router))
     });
 
+    // Whoever finishes a transmission over RF is answered with how well they were heard, if that's wanted
+    let acks = config.ack.clone().map(|ack| ack::start(ack, config.station.clone(), &mut router));
+
     // The links
     let reflector_port = router.attach(reflector::LINK_KIND, router::Scope::Everyone);
     tokio::spawn(reflector::run(config.clone(), directory.clone(), command_receiver, reflector_port, shared.clone(), speaker.clone()));
@@ -75,7 +81,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
 
     // Pass voice between the radio and the links until told to stop
     tokio::select! {
-        _ = router.run(router::RadioTaps::new(position_reports, speaker), shared) => Ok(()),
+        _ = router.run(router::RadioTaps::new(position_reports, speaker, acks), shared) => Ok(()),
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }

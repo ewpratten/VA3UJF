@@ -219,10 +219,11 @@ impl Node {
         let peers: Vec<PeerStatus> = self
             .links
             .iter()
-            .map(|link| PeerStatus { id: link.node.clone(), mode: if link.mode == LinkMode::Monitor { "monitor" } else { "transceive" }, outbound: link.outbound, connected: link.up, keyed: link.rx_keyed || link.tx_keyed })
+            .map(|link| PeerStatus { id: link.node.clone(), mode: if link.mode == LinkMode::Monitor { "monitor" } else { "transceive" }, outbound: link.outbound, connected: link.up, keyed: link.rx_keyed || link.tx_keyed, talking: link.rx_keyed })
             .collect();
         let spoken = spoken_links(self.allstar.node, &peers);
         state::update(&self.shared, |snapshot| {
+            state::sync_link_peers(snapshot, super::LINK_KIND, &peers);
             let status = state::link_mut(snapshot, super::LINK_NAME, super::LINK_KIND);
             (status.connected, status.peers, status.spoken) = (peers.iter().any(|peer| peer.connected), peers, spoken);
         });
@@ -885,6 +886,10 @@ mod tests {
         transmit(&first.to_node, 30).await;
         let heard = heard_frames(&mut second.from_node, Duration::from_secs(3)).await.expect("the transmission to end");
         assert!((25..=35).contains(&heard), "second node heard {heard} of 30 frames");
+
+        // The node that spoke is now a peer of the one that heard it, and isn't talking any more
+        let peers = state::read(&second.shared).peers;
+        assert_eq!((peers.len(), peers[0].callsign.as_str(), peers[0].via, peers[0].transmissions, peers[0].talking, peers[0].linked), (1, "10001", "allstar", 1, false, Some(true)));
 
         // And back the other way, over the same link
         transmit(&second.to_node, 30).await;

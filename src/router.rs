@@ -1,7 +1,11 @@
 // Arbitrates the channel between the radio and its links, and fans each stream out to where it belongs
 
+use crate::ack::AckRequest;
+use crate::codec::fec;
 use crate::dprs;
 use crate::dstar::{pad, Frame, Header};
+use crate::live::Event;
+use crate::slowdata::{Decoded, Decoder};
 use crate::speech::{Announcement, Speaker};
 use crate::state::{self, Shared, Transmission};
 use std::time::Duration;
@@ -31,6 +35,9 @@ pub struct Port {
 struct Member {
     kind: &'static str,
     scope: Scope,
+
+    // Whether its transmissions are a station to list as a peer
+    tracked: bool,
     to_member: mpsc::Sender<Frame>,
 }
 
@@ -63,6 +70,15 @@ impl Router {
 
     // Connect a link, which is then named in the transmission log by its kind
     pub fn attach(&mut self, kind: &'static str, scope: Scope) -> Port {
+        self.attach_member(kind, scope, scope == Scope::Everyone)
+    }
+
+    // Connect a link that speaks for parties of its own, which it reports itself, rather than being one
+    pub fn attach_bridge(&mut self, kind: &'static str) -> Port {
+        self.attach_member(kind, Scope::Everyone, false)
+    }
+
+    fn attach_member(&mut self, kind: &'static str, scope: Scope, tracked: bool) -> Port {
         let index = self.members.len();
         let (to_router, mut from_member) = mpsc::channel(PORT_DEPTH);
         let (to_member, from_router) = mpsc::channel(PORT_DEPTH);
@@ -74,7 +90,7 @@ impl Router {
                 }
             }
         });
-        self.members.push(Member { kind, scope, to_member });
+        self.members.push(Member { kind, scope, tracked, to_member });
         Port { to_router, from_router }
     }
 
@@ -82,7 +98,10 @@ impl Router {
         // The router stops once every link has gone, which needs it to hold no handle on its own inbox
         let Router { mut inbox, inbox_sender, members } = self;
         drop(inbox_sender);
-        let mut active: Option<(usize, Instant)> = None;
+        let mut events = shared.subscribe_events();
+        let mut decoders: Vec<Decoder> = members.iter().map(|_| Decoder::default()).collect();
+        let mut quality = RfQuality::default();
+        let mut active: Option<Active> = None;
         let mut tick = interval(Duration::from_millis(250));
 
         loop {
@@ -91,8 +110,17 @@ impl Router {
                     Some(received) => received,
                     None => return,
                 },
+                event = events.recv() => {
+                    // How well the radio is hearing whoever is on the air
+                    if let Ok(Event::Signal { dbm, .. }) = event
+                        && active.as_ref().is_some_and(|holder| holder.member == 0)
+                    {
+                        quality.signal(dbm);
+                    }
+                    continue;
+                }
                 _ = tick.tick() => {
-                    if active.is_some_and(|(_, heard)| heard.elapsed() > STREAM_TIMEOUT) {
+                    if active.as_ref().is_some_and(|holder| holder.heard.elapsed() > STREAM_TIMEOUT) {
                         active = None;
                         state::update(&shared, state::finish_transmission);
                     }
@@ -101,7 +129,7 @@ impl Router {
             };
 
             // Local-only voice, like an announcement, is cut off by anyone else keying up
-            if let (Frame::Header(_), Some((holder, _))) = (&frame, active)
+            if let (Frame::Header(_), Some(holder)) = (&frame, active.as_ref().map(|holder| holder.member))
                 && holder != sender
                 && members[holder].scope == Scope::LocalOnly
             {
@@ -112,32 +140,150 @@ impl Router {
             }
 
             // Whoever keys up first holds the channel until they finish
-            let holds_channel = match (&frame, active) {
+            let holds_channel = match (&frame, &active) {
                 (Frame::Header(_), None) => true,
-                (_, Some((holder, _))) => holder == sender,
+                (_, Some(holder)) => holder.member == sender,
                 _ => false,
             };
             if !holds_channel {
                 continue;
             }
-            active = if matches!(frame, Frame::End) { None } else { Some((sender, Instant::now())) };
 
-            // Record the transmission for the web UI
             let kind = members[sender].kind;
-            match &frame {
-                Frame::Header(header) => {
-                    log::info!("Heard {} via {kind}", header.my_call_text());
-                    state::update(&shared, |snapshot| snapshot.current = Some(Transmission { source: kind, callsign: header.my_call_text(), started_at: state::unix_now(), seconds: 0 }));
+            let tracked = members[sender].tracked;
+            if let Frame::Header(header) = &frame {
+                let callsign = header.my_call_text();
+                log::info!("Heard {callsign} via {kind}");
+                decoders[sender].reset();
+                if sender == 0 {
+                    quality = RfQuality::default();
                 }
-                Frame::End => state::update(&shared, state::finish_transmission),
-                Frame::Voice { .. } => {}
+                state::update(&shared, |snapshot| {
+                    snapshot.current = Some(Transmission { source: kind, callsign: callsign.clone(), started_at: state::unix_now(), seconds: 0, tracked });
+                    if tracked {
+                        state::peer_keyed_up(snapshot, &callsign, kind);
+                    }
+                });
+                active = Some(Active { member: sender, heard: Instant::now(), header: *header, callsign });
+            }
+            let Some(holder) = active.as_mut() else { continue };
+            holder.heard = Instant::now();
+            let callsign = holder.callsign.clone();
+
+            // What's in the slow data, and how clean the voice is
+            if let Frame::Voice { ambe, slow_data, .. } = &frame {
+                if sender == 0 {
+                    quality.voice(ambe);
+                }
+                if tracked && let Some(decoded) = decoders[sender].push(*slow_data) {
+                    publish_decoded(&shared, &mut taps, sender == 0, &callsign, decoded);
+                }
             }
 
-            if sender == 0 && taps.observe(&frame) {
+            // An info request is answered out loud, and goes no further than the repeater
+            let for_repeater_only = sender == 0 && taps.observe(&frame);
+
+            if matches!(frame, Frame::End) {
+                let finished = active.take();
+                state::update(&shared, state::finish_transmission);
+                if let (0, false, Some(finished)) = (sender, for_repeater_only, finished) {
+                    report_quality(&shared, &taps, &finished, &quality);
+                }
+            }
+            if for_repeater_only {
                 continue;
             }
             deliver(&members, sender, &frame).await;
         }
+    }
+}
+
+// The holder of the channel
+struct Active {
+    member: usize,
+    heard: Instant,
+    header: Header,
+    callsign: String,
+}
+
+// How well the radio heard an RF transmission
+#[derive(Default)]
+struct RfQuality {
+    frames: u32,
+    errors: u32,
+    dbm_total: f32,
+    dbm_readings: u32,
+}
+
+impl RfQuality {
+    fn voice(&mut self, ambe: &[u8; 9]) {
+        self.frames += 1;
+        if *ambe != fec::SILENCE {
+            self.errors += fec::bit_errors(ambe);
+        }
+    }
+
+    fn signal(&mut self, dbm: Option<f32>) {
+        if let Some(dbm) = dbm {
+            self.dbm_total += dbm;
+            self.dbm_readings += 1;
+        }
+    }
+
+    // Each frame of voice is 48 bits of the ones the error correction looks at
+    fn ber_percent(&self) -> f32 {
+        if self.frames == 0 { 0.0 } else { self.errors as f32 * 100.0 / (self.frames * 48) as f32 }
+    }
+
+    fn dbm(&self) -> Option<f32> {
+        (self.dbm_readings > 0).then(|| self.dbm_total / self.dbm_readings as f32)
+    }
+}
+
+// Pass on what a transmission's slow data said
+fn publish_decoded(shared: &Shared, taps: &mut RadioTaps, from_radio: bool, callsign: &str, decoded: Decoded) {
+    let (kind, text) = match decoded {
+        Decoded::Text(text) => {
+            state::update(shared, |snapshot| {
+                if let Some(peer) = state::peer_mut(snapshot, callsign) {
+                    peer.message = text.clone();
+                }
+            });
+            ("text", text)
+        }
+        Decoded::Gps(line) => {
+            if let Some(fix) = dprs::parse_fix(&line) {
+                shared.emit(Event::Position { callsign: callsign.to_string(), latitude: fix.latitude, longitude: fix.longitude, comment: fix.comment.clone() });
+                state::update(shared, |snapshot| {
+                    if let Some(peer) = state::peer_mut(snapshot, callsign) {
+                        peer.fix = Some(fix);
+                    }
+                });
+            }
+
+            // Only what's heard directly over RF is the IGate's to pass on
+            if from_radio {
+                taps.gps_report(&line);
+            }
+            ("gps", line)
+        }
+        Decoded::Other { kind, bytes } => (kind, bytes.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(" ")),
+    };
+    shared.emit(Event::SlowData { callsign: callsign.to_string(), kind, text });
+}
+
+// Tell the web UI how an RF transmission went, and have the repeater say so to whoever sent it
+fn report_quality(shared: &Shared, taps: &RadioTaps, finished: &Active, quality: &RfQuality) {
+    let (ber_percent, dbm, seconds) = (quality.ber_percent(), quality.dbm(), quality.frames as f32 / 50.0);
+    state::update(shared, |snapshot| {
+        if let Some(peer) = state::peer_mut(snapshot, &finished.callsign) {
+            (peer.ber_percent, peer.dbm) = (Some(ber_percent), dbm);
+        }
+    });
+    shared.emit(Event::Quality { callsign: finished.callsign.clone(), ber_percent, dbm, seconds });
+    log::info!("{} was heard with BER {ber_percent:.1}%{}", finished.callsign, dbm.map(|dbm| format!(", {dbm:.0} dBm")).unwrap_or_default());
+    if let Some(acks) = &taps.acks {
+        let _ = acks.try_send(AckRequest { your_call: finished.header.my_call, ber_percent, dbm });
     }
 }
 
@@ -151,32 +297,28 @@ fn is_info_request(header: &Header) -> bool {
 pub struct RadioTaps {
     pub position_reports: Option<mpsc::Sender<String>>,
     pub speaker: Option<Speaker>,
-    position_collector: dprs::Collector,
+    pub acks: Option<mpsc::Sender<AckRequest>>,
 
     // Whether the stream being heard is a request to the repeater, which goes no further than it
     request_stream: bool,
 }
 
 impl RadioTaps {
-    pub fn new(position_reports: Option<mpsc::Sender<String>>, speaker: Option<Speaker>) -> Self {
-        RadioTaps { position_reports, speaker, ..Default::default() }
+    pub fn new(position_reports: Option<mpsc::Sender<String>>, speaker: Option<Speaker>, acks: Option<mpsc::Sender<AckRequest>>) -> Self {
+        RadioTaps { position_reports, speaker, acks, request_stream: false }
     }
 
-    // Returns whether the frame was for the repeater alone
-    fn observe(&mut self, frame: &Frame) -> bool {
-        // Position reports ride in the slow data
-        match frame {
-            Frame::Header(_) | Frame::End => self.position_collector.reset(),
-            Frame::Voice { slow_data, .. } => {
-                if let (Some(report), Some(reports)) = (self.position_collector.push(*slow_data), &self.position_reports)
-                    && reports.try_send(report).is_err()
-                {
-                    log::warn!("APRS-IS isn't keeping up, dropping a position report");
-                }
-            }
+    // A position report heard over RF, on its way to APRS-IS
+    fn gps_report(&mut self, report: &str) {
+        if let Some(reports) = &self.position_reports
+            && reports.try_send(report.to_string()).is_err()
+        {
+            log::warn!("APRS-IS isn't keeping up, dropping a position report");
         }
+    }
 
-        // An info request is answered out loud, once whoever sent it has finished transmitting
+    // An info request is answered out loud, once whoever sent it has finished transmitting. Returns whether the frame was for the repeater alone
+    fn observe(&mut self, frame: &Frame) -> bool {
         if let Frame::Header(header) = frame {
             self.request_stream = is_info_request(header);
             if self.request_stream {
@@ -224,7 +366,7 @@ mod tests {
         let (mut router, radio) = Router::new();
         let mut link = router.attach("test", Scope::Everyone);
         let (speaker, mut announcements) = mpsc::channel(4);
-        tokio::spawn(router.run(RadioTaps::new(None, Some(speaker)), Shared::default()));
+        tokio::spawn(router.run(RadioTaps::new(None, Some(speaker), None), Shared::default()));
 
         // The request is spoken back, and none of it reaches the link
         transmit(&radio.to_router, "       I").await;
@@ -291,6 +433,122 @@ mod tests {
         assert!(matches!(heard.as_slice(), [Frame::Voice { .. }, Frame::End, Frame::Header(_)]), "{heard:?}");
         announcer.to_router.send(Frame::Voice { sequence: 1, ambe: [1; 9], slow_data: [2; 3] }).await.unwrap();
         assert!(heard_nothing(&mut radio).await, "the announcement carried on over the conversation");
+    }
+
+    async fn rf_transmission(radio: &Port, frames: Vec<Frame>) {
+        radio.to_router.send(Frame::Header(header("CQCQCQ"))).await.unwrap();
+        for frame in frames {
+            radio.to_router.send(frame).await.unwrap();
+        }
+        radio.to_router.send(Frame::End).await.unwrap();
+    }
+
+    async fn event(events: &mut tokio::sync::broadcast::Receiver<Event>, wanted: impl Fn(&Event) -> bool) -> Event {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await.expect("an event").unwrap();
+            if wanted(&event) {
+                return event;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_station_that_keys_up_is_a_peer_that_lights_up_while_it_talks() {
+        let (router, radio) = Router::new();
+        let shared = Shared::default();
+        tokio::spawn(router.run(RadioTaps::default(), shared.clone()));
+
+        radio.to_router.send(Frame::Header(header("CQCQCQ"))).await.unwrap();
+        for _ in 0..50 {
+            if state::read(&shared).peers.first().is_some_and(|peer| peer.talking) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let talking = state::read(&shared).peers;
+        assert_eq!((talking[0].callsign.as_str(), talking[0].via, talking[0].talking), ("N0TEST/TEST", "rf", true));
+
+        radio.to_router.send(Frame::End).await.unwrap();
+        for _ in 0..50 {
+            if state::read(&shared).peers.first().is_some_and(|peer| !peer.talking) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let finished = state::read(&shared).peers;
+        assert_eq!((finished.len(), finished[0].talking, finished[0].transmissions), (1, false, 1));
+    }
+
+    #[tokio::test]
+    async fn slow_data_text_and_positions_reach_the_peer_and_the_event_stream() {
+        let (mut router, radio) = Router::new();
+        let _link = router.attach("link", Scope::Everyone);
+        let shared = Shared::default();
+        let mut events = shared.subscribe_events();
+        let (reports, mut gated) = mpsc::channel(4);
+        tokio::spawn(router.run(RadioTaps::new(Some(reports), None, None), shared.clone()));
+
+        let report = "N0TEST>API282,DSTAR*:!4530.00N/07545.60W>Hi\r";
+        let mut frames: Vec<Frame> = crate::dprs::testing::slow_data_frames(report).into_iter().map(|slow_data| Frame::Voice { sequence: 0, ambe: [1; 9], slow_data }).collect();
+        frames.extend(crate::dstar::build_slow_data_blocks("Hello").into_iter().map(|slow_data| Frame::Voice { sequence: 0, ambe: [1; 9], slow_data }));
+        rf_transmission(&radio, frames).await;
+
+        let Event::Position { callsign, latitude, .. } = event(&mut events, |event| matches!(event, Event::Position { .. })).await else { unreachable!() };
+        assert_eq!((callsign.as_str(), latitude), ("N0TEST/TEST", 45.5));
+        let Event::SlowData { text, .. } = event(&mut events, |event| matches!(event, Event::SlowData { kind: "text", .. })).await else { unreachable!() };
+        assert!(text.starts_with("Hel"), "{text}");
+
+        // The report is also on its way to APRS-IS, and the peer remembers where it is and what it said
+        assert!(gated.recv().await.unwrap().starts_with("N0TEST>API282"));
+        let peers = state::read(&shared).peers;
+        assert_eq!((peers[0].fix.as_ref().map(|fix| fix.latitude), peers[0].message.as_str()), (Some(45.5), "Hello"));
+    }
+
+    #[tokio::test]
+    async fn an_rf_transmission_is_measured_and_its_sender_is_acknowledged() {
+        let (router, radio) = Router::new();
+        let shared = Shared::default();
+        let mut events = shared.subscribe_events();
+        let (acks, mut requests) = mpsc::channel(4);
+        tokio::spawn(router.run(RadioTaps::new(None, None, Some(acks)), shared.clone()));
+
+        // Ten clean frames of voice, and one that lost a bit on the way
+        let clean = fec::testing::frame_for(0x5A3, 0x2C7);
+        let mut frames: Vec<Frame> = (0..10).map(|_| Frame::Voice { sequence: 0, ambe: clean, slow_data: [0; 3] }).collect();
+        frames.push(Frame::Voice { sequence: 0, ambe: fec::testing::damaged(clean, 0), slow_data: [0; 3] });
+        shared.emit(Event::Signal { raw: 1, dbm: Some(-90.0) });
+        rf_transmission(&radio, frames).await;
+
+        let Event::Quality { callsign, ber_percent, seconds, .. } = event(&mut events, |event| matches!(event, Event::Quality { .. })).await else { unreachable!() };
+        assert_eq!(callsign, "N0TEST/TEST");
+        assert!((ber_percent - 100.0 / 528.0).abs() < 0.01 && seconds > 0.2, "{ber_percent}% over {seconds}s");
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.your_call, pad("N0TEST"));
+    }
+
+    #[tokio::test]
+    async fn an_info_request_is_measured_but_not_acknowledged() {
+        let (router, radio) = Router::new();
+        let (acks, mut requests) = mpsc::channel(4);
+        let (speaker, _announcements) = mpsc::channel(4);
+        tokio::spawn(router.run(RadioTaps::new(None, Some(speaker), Some(acks)), Shared::default()));
+
+        transmit(&radio.to_router, "       I").await;
+        assert!(tokio::time::timeout(Duration::from_millis(300), requests.recv()).await.is_err(), "an info request was acknowledged");
+        transmit(&radio.to_router, "CQCQCQ").await;
+        assert!(requests.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_bridge_is_not_listed_as_a_peer_but_still_carries_voice() {
+        let (mut router, mut radio) = Router::new();
+        let bridge = router.attach_bridge("bridge");
+        let shared = Shared::default();
+        tokio::spawn(router.run(RadioTaps::default(), shared.clone()));
+
+        transmit(&bridge.to_router, "CQCQCQ").await;
+        assert!(heard_header(&mut radio).await);
+        assert!(state::read(&shared).peers.is_empty(), "the bridge was listed as a station");
     }
 
     #[tokio::test]

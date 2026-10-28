@@ -12,7 +12,7 @@ pub mod testing;
 
 use crate::bridge;
 use crate::config::{Action, Allstar, ScheduleEntry, Station};
-use crate::router::{Router, Scope};
+use crate::router::Router;
 use crate::speech::Speaker;
 use crate::state::{self, AllstarStatus, ScheduledRun, Shared};
 use anyhow::{bail, Context};
@@ -63,7 +63,7 @@ pub fn start(allstar: Allstar, station: Station, shared: Shared, router: &mut Ro
         rx_gain_db: allstar.rx_gain_db,
         tx_gain_db: allstar.tx_gain_db,
     };
-    let port = router.attach(LINK_KIND, Scope::Everyone);
+    let port = router.attach_bridge(LINK_KIND);
     let (bridge_shared, node_shared, schedule_shared) = (shared.clone(), shared.clone(), shared);
     tokio::spawn(async move {
         if let Err(error) = bridge::run(settings, station, bridge_shared, port, from_node, bridge_to_node).await {

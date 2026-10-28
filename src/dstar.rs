@@ -8,6 +8,9 @@ const CRC_X25: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
 pub const END_SLOW_DATA: [u8; 3] = [0x55, 0x55, 0x55];
 pub const FRAMES_PER_SUPERFRAME: u8 = 21;
 
+// A frame of voice that's silence, as a radio would be sent it
+pub const SILENT_AMBE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
+
 // The 39 bytes the CRC covers, which is also the layout DCS and DExtra carry
 #[derive(Clone, Copy, Debug, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]

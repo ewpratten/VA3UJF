@@ -1,19 +1,25 @@
-// Minimal web UI for watching the hotspot and controlling its reflector link
+// Web UI for watching the hotspot live and controlling its links
 
 use crate::allstar;
 use crate::config::{Action, Config};
 use crate::hosts::{self, Directory};
 use crate::reflector::Command;
 use crate::state::{self, Shared};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::interval;
 
 const PAGE: &str = include_str!("page.html");
+
+// Changes to the status are sent in batches, so a busy link doesn't flood the page
+const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 struct App {
@@ -52,8 +58,8 @@ async fn index(State(app): State<App>) -> Html<String> {
     let station = &app.config.station;
     Html(
         PAGE.replace("{{callsign}}", &escape(&station.callsign))
-            .replace("{{frequency}}", &format!("{:.4}", station.frequency_mhz))
-            .replace("{{module}}", &escape(&station.module))
+            .replace("{{latitude}}", &station.latitude.to_string())
+            .replace("{{longitude}}", &station.longitude.to_string())
             .replace("{{reflector_options}}", &options),
     )
 }
@@ -64,6 +70,47 @@ async fn status(State(app): State<App>) -> Json<state::Snapshot> {
         current.seconds = state::unix_now().saturating_sub(current.started_at);
     }
     Json(snapshot)
+}
+
+// The status as it is now, then each change to it, along with the events as they happen
+async fn stream(app: App, mut socket: WebSocket) {
+    let mut snapshots = app.shared.subscribe();
+    let mut events = app.shared.subscribe_events();
+    let mut batch = interval(SNAPSHOT_INTERVAL);
+    let mut changed = true;
+    loop {
+        let message = tokio::select! {
+            result = snapshots.changed() => {
+                if result.is_err() {
+                    return;
+                }
+                changed = true;
+                continue;
+            }
+            _ = batch.tick() => {
+                if !std::mem::take(&mut changed) {
+                    continue;
+                }
+                serde_json::json!({ "type": "snapshot", "snapshot": state::read(&app.shared) })
+            }
+            event = events.recv() => match event {
+                Ok(event) => serde_json::json!(event),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            received = socket.recv() => match received {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => continue,
+            },
+        };
+        if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn live(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| stream(app, socket))
 }
 
 async fn link(State(app): State<App>, Form(form): Form<LinkForm>) -> Response {
@@ -102,11 +149,76 @@ async fn allstar_unlink(State(app): State<App>, Form(form): Form<AllstarUnlinkFo
     allstar_action(&app, Action { unlink: Some(form.node.trim().to_string()), ..Action::default() }).await
 }
 
+fn routes(app: App) -> Router {
+    Router::new().route("/", get(index)).route("/api/status", get(status)).route("/live", get(live)).route("/link", post(link)).route("/unlink", post(unlink)).route("/allstar/link", post(allstar_link)).route("/allstar/unlink", post(allstar_unlink)).with_state(app)
+}
+
 pub async fn serve(config: Config, directory: Directory, shared: Shared, commands: mpsc::Sender<Command>, allstar: Option<allstar::Handle>) -> anyhow::Result<()> {
     let address = config.http_listen.clone().unwrap_or_else(|| "0.0.0.0:8080".to_string());
-    let app = Router::new().route("/", get(index)).route("/api/status", get(status)).route("/link", post(link)).route("/unlink", post(unlink)).route("/allstar/link", post(allstar_link)).route("/allstar/unlink", post(allstar_unlink)).with_state(App { config, directory, shared, commands, allstar });
+    let app = routes(App { config, directory, shared, commands, allstar });
     let listener = tokio::net::TcpListener::bind(&address).await?;
     log::info!("Web UI on http://{address}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::Event;
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    async fn next_json(socket: &mut (impl StreamExt<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>> + Unpin)) -> serde_json::Value {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(3), socket.next()).await.expect("a message").expect("the socket to stay open").unwrap();
+            if let ClientMessage::Text(text) = message {
+                return serde_json::from_str(text.as_str()).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_page_is_sent_the_status_and_then_each_change_and_event_as_it_happens() {
+        let config: Config = toml::from_str("[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.25\nlongitude = -90.5\n[modem]\nport = \"/dev/null\"\n").unwrap();
+        let directory = hosts::directory(&config);
+        let shared = Shared::default();
+        let (commands, _unused) = mpsc::channel(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = App { config, directory, shared: shared.clone(), commands, allstar: None };
+        tokio::spawn(async move { axum::serve(listener, routes(app)).await });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/live")).await.unwrap();
+
+        // The status comes first
+        let first = next_json(&mut socket).await;
+        assert_eq!((first["type"].as_str(), first["snapshot"]["modem_connected"].as_bool()), (Some("snapshot"), Some(false)));
+
+        // Events arrive as they happen
+        shared.emit(Event::Signal { raw: 1100, dbm: Some(-95.0) });
+        let event = next_json(&mut socket).await;
+        assert_eq!((event["type"].as_str(), event["raw"].as_u64(), event["dbm"].as_f64()), (Some("signal"), Some(1100), Some(-95.0)));
+        shared.emit(Event::Position { callsign: "N0TEST".into(), latitude: 45.5, longitude: -75.5, comment: "Hi".into() });
+        assert_eq!(next_json(&mut socket).await["type"], "position");
+
+        // And a change to the status follows
+        state::update(&shared, |snapshot| snapshot.modem_connected = true);
+        loop {
+            let message = next_json(&mut socket).await;
+            if message["type"] == "snapshot" {
+                assert_eq!(message["snapshot"]["modem_connected"], true);
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_page_knows_where_the_repeater_is() {
+        let config: Config = toml::from_str("[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.25\nlongitude = -90.5\n[modem]\nport = \"/dev/null\"\n").unwrap();
+        let directory = hosts::directory(&config);
+        let app = App { config, directory, shared: Shared::default(), commands: mpsc::channel(1).0, allstar: None };
+        let Html(page) = index(State(app)).await;
+        assert!(page.contains("latitude: 45.25, longitude: -90.5"), "the repeater's position wasn't filled in");
+        assert!(!page.contains("{{"), "a placeholder was left in the page");
+    }
 }
