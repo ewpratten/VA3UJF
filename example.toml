@@ -24,6 +24,11 @@ name = "DCS999"
 protocol = "dcs"
 address = "192.0.2.10"
 
+# Announces links coming and going, and reads the repeater's status back when someone sends an info request. A Piper voice does the speaking inside
+# this program, and it's vocoded through the AMBEserver below, so this needs an [allstar] section. The Docker image carries a voice in the default directory
+[speech]
+# voice_directory = "/usr/share/va3ujf/voice"
+
 [allstar]
 node = 12345
 ambeserver = "127.0.0.1:2460"

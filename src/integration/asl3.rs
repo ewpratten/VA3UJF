@@ -100,10 +100,13 @@ async fn asl3_links_to_our_container_and_hangs_up_on_it() {
     let directory = std::env::temp_dir().join(format!("va3ujf-test-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let config = directory.join("config.toml");
-    std::fs::write(&config, format!("http_listen = \"0.0.0.0:8080\"\n[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0\n[modem]\nport = \"/dev/ttyS0\"\n[allstar]\nnode = {OUR_NODE}\nambeserver = \"127.0.0.1:2460\"\npark_reflector = false\n[allstar.nodes]\n\"{HUB}\" = \"asl3:4569\"\n")).unwrap();
+    std::fs::write(&config, format!("http_listen = \"0.0.0.0:8080\"\n[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0\n[modem]\nport = \"/dev/ttyS0\"\n[speech]\n[allstar]\nnode = {OUR_NODE}\nambeserver = \"127.0.0.1:2460\"\npark_reflector = false\n[allstar.nodes]\n\"{HUB}\" = \"asl3:4569\"\n")).unwrap();
     let mount = format!("{}:/etc/va3ujf.toml:ro", config.display());
     let ours = Container::start("va3ujf-test", &["--network", &network.name, "--network-alias", "hotspot", "--publish", "127.0.0.1::8080", "--volume", &mount]).unwrap();
     ours.wait_for_logs("listening for IAX2", Duration::from_secs(30)).unwrap();
+
+    // The image carries its own voice, and the speech engine linked into the binary can load it
+    ours.wait_for_logs("Announcements ready", Duration::from_secs(60)).unwrap();
     let web_port = ours.host_port("8080/tcp").unwrap();
 
     // The hub dials us, and we only accept because DNS (here, Docker's) agrees it's calling from where it says
