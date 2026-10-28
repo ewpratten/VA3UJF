@@ -2,6 +2,7 @@
 
 use crate::config::{Config, Protocol, Reflector};
 use crate::hosts::{self, Directory};
+use crate::speech::{self, Speaker};
 use crate::state::{self, LinkStatus, Shared};
 use crate::dstar::{pad, Frame, Header, END_SLOW_DATA, FRAMES_PER_SUPERFRAME};
 use anyhow::{bail, Context};
@@ -169,7 +170,7 @@ async fn transmit(active: &Active, config: &Config, streams: &mut Streams, frame
 }
 
 // Turn a packet from the reflector into frames for the modem.
-async fn receive(active: &mut Active, config: &Config, streams: &mut Streams, packet: &[u8], from_reflector: &mpsc::Sender<Frame>) -> anyhow::Result<()> {
+async fn receive(active: &mut Active, config: &Config, streams: &mut Streams, packet: &[u8], from_reflector: &mpsc::Sender<Frame>, speaker: &Option<Speaker>) -> anyhow::Result<()> {
     active.last_heard = Instant::now();
     let length = packet.len();
     let is_ack = length == 14 && &packet[10..13] == b"ACK";
@@ -182,6 +183,7 @@ async fn receive(active: &mut Active, config: &Config, streams: &mut Streams, pa
     if is_ack {
         if !active.connected {
             log::info!("Linked to {}", active.target_text());
+            speech::say(speaker, format!("Linked to reflector {}.", speech::spoken_reflector(&active.target_text())));
         }
         active.connected = true;
         return Ok(());
@@ -249,7 +251,7 @@ async fn forward_header(streams: &mut Streams, stream_id: u16, header: Option<He
 }
 
 // Run the reflector link manager, taking link and unlink commands, and bridging frames in both directions
-pub async fn run(config: Config, directory: Directory, mut commands: mpsc::Receiver<Command>, from_reflector: mpsc::Sender<Frame>, mut to_reflector: mpsc::Receiver<Frame>, shared: Shared) {
+pub async fn run(config: Config, directory: Directory, mut commands: mpsc::Receiver<Command>, from_reflector: mpsc::Sender<Frame>, mut to_reflector: mpsc::Receiver<Frame>, shared: Shared, speaker: Option<Speaker>) {
     let mut active: Option<Active> = None;
     let mut streams = Streams::default();
     let mut tick = interval(Duration::from_millis(250));
@@ -278,7 +280,7 @@ pub async fn run(config: Config, directory: Directory, mut commands: mpsc::Recei
                 let packet = buffer[..length].to_vec();
                 if let Some(link) = active.as_mut() {
                     if source == link.destination {
-                        if let Err(error) = receive(link, &config, &mut streams, &packet, &from_reflector).await {
+                        if let Err(error) = receive(link, &config, &mut streams, &packet, &from_reflector, &speaker).await {
                             log::debug!("Bad reflector packet: {error}");
                         }
                     }
@@ -292,6 +294,9 @@ pub async fn run(config: Config, directory: Directory, mut commands: mpsc::Recei
                     let packet = link.connect_packet(&config, true);
                     link.send(&packet).await;
                     log::info!("Unlinked from {}", link.target_text());
+                    if link.connected {
+                        speech::say(&speaker, format!("Unlinked from reflector {}.", speech::spoken_reflector(&link.target_text())));
+                    }
                 }
                 if let Command::Link { name, module } = command {
                     match open(&directory, &name, module).await {

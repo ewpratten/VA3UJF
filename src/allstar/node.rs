@@ -5,6 +5,7 @@ use super::iax2::{self, command, control, ie, Datagram, Event, FullFrame, Ies, S
 use super::{network, ulaw, Audio, Command, LinkMode};
 use crate::config::{Allstar, Station};
 use crate::reflector;
+use crate::speech::{self, Speaker};
 use crate::state::{self, AllstarLink, Shared};
 use anyhow::Context;
 use std::collections::{HashSet, VecDeque};
@@ -202,6 +203,7 @@ struct Node {
     internal: mpsc::Sender<Internal>,
     to_bridge: mpsc::Sender<Audio>,
     reflector_commands: mpsc::Sender<reflector::Command>,
+    speaker: Option<Speaker>,
     links: Vec<Link>,
     dstar_buffer: Buffer,
     dstar_keyed: bool,
@@ -451,6 +453,9 @@ impl Node {
     fn close(&mut self, node: &str, now: Instant) {
         let Some(index) = self.index_of(node) else { return };
         let link = &mut self.links[index];
+        if link.up {
+            speech::say(&self.speaker, format!("Node {} disconnected.", speech::spelled(node)));
+        }
         link.up = false;
         link.hangup_at = None;
         link.rx_keyed = false;
@@ -524,6 +529,7 @@ impl Node {
             session.send_text(now, NEWKEY_ONE);
         }
         log::info!("AllStar: linked to node {node} ({})", if link.outbound { "outbound" } else { "inbound" });
+        speech::say(&self.speaker, format!("Node {} connected.", speech::spelled(node)));
         self.kick_link_lists(now);
         self.after_links_changed(now);
     }
@@ -536,6 +542,9 @@ impl Node {
         }
         let link = &mut self.links[index];
         let was_up = link.up;
+        if was_up {
+            speech::say(&self.speaker, format!("Node {} disconnected.", speech::spelled(node)));
+        }
         (link.up, link.tx_keyed, link.rx_keyed, link.session, link.resolving) = (false, false, false, None, false);
         link.remote_list.clear();
         let redial = link.wanted && (link.outbound || link.permanent) && (link.permanent || link.retries < MAX_RETRIES);
@@ -876,7 +885,8 @@ impl Node {
     }
 }
 
-pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_commands: mpsc::Sender<reflector::Command>, mut from_bridge: mpsc::Receiver<Audio>, to_bridge: mpsc::Sender<Audio>, mut commands: mpsc::Receiver<Command>) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_commands: mpsc::Sender<reflector::Command>, speaker: Option<Speaker>, mut from_bridge: mpsc::Receiver<Audio>, to_bridge: mpsc::Sender<Audio>, mut commands: mpsc::Receiver<Command>) -> anyhow::Result<()> {
     let socket = Arc::new(UdpSocket::bind(("0.0.0.0", allstar.iax_port)).await.with_context(|| format!("couldn't bind IAX2 port {}", allstar.iax_port))?);
     let directory = Arc::new(Directory::new(&allstar.dns_domain, &allstar.nodes)?);
     log::info!("AllStar node {} listening for IAX2 on port {}", allstar.node, allstar.iax_port);
@@ -897,6 +907,7 @@ pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_
         internal,
         to_bridge,
         reflector_commands,
+        speaker,
         links: Vec::new(),
         dstar_buffer: Buffer::default(),
         dstar_keyed: false,
@@ -936,7 +947,8 @@ pub async fn run(allstar: Allstar, _station: Station, shared: Shared, reflector_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allstar::testing::{has_no_links, heard_frames, heard_levels, linked, start_node, transmit, transmit_level, wait_for};
+    use crate::allstar::testing::{has_no_links, heard_frames, heard_levels, linked, start_node, start_node_speaking, transmit, transmit_level, wait_for};
+    use crate::speech::Announcement;
 
     #[test]
     fn listed_modes_are_downgraded_through_weaker_links() {
@@ -967,6 +979,34 @@ mod tests {
         // Unlinking from one end drops it at both
         first.handle.run_action(&crate::config::Action { unlink: Some("10002".into()), ..Default::default() }).await.unwrap();
         wait_for("both nodes to drop the link", || has_no_links(&first) && has_no_links(&second)).await;
+    }
+
+    async fn next_announcement(announcements: &mut mpsc::Receiver<Announcement>) -> Option<Announcement> {
+        tokio::time::timeout(Duration::from_secs(5), announcements.recv()).await.expect("an announcement")
+    }
+
+    // Links coming and going are announced once each, whichever end drops them
+    #[tokio::test]
+    async fn links_coming_and_going_are_announced() {
+        let (speaker, mut announcements) = mpsc::channel(8);
+        let first = start_node_speaking(10021, 24574, &[(10022, "127.0.0.1:24575".into())], Some(speaker));
+        let second = start_node(10022, 24575, &[(10021, "127.0.0.1:24574".into())]);
+        let said = |text: &str| Announcement::Text(text.to_string());
+        let action = |link: Option<&str>, unlink: Option<&str>| crate::config::Action { link: link.map(Into::into), unlink: unlink.map(Into::into), ..Default::default() };
+
+        // Linking, and then unlinking from this end
+        first.handle.run_action(&action(Some("10022"), None)).await.unwrap();
+        assert_eq!(next_announcement(&mut announcements).await, Some(said("Node 1 0 0 2 2 connected.")));
+        first.handle.run_action(&action(None, Some("10022"))).await.unwrap();
+        assert_eq!(next_announcement(&mut announcements).await, Some(said("Node 1 0 0 2 2 disconnected.")));
+        wait_for("both ends to let go", || has_no_links(&first) && has_no_links(&second)).await;
+
+        // Linking again, and then the far end unlinking
+        first.handle.run_action(&action(Some("10022"), None)).await.unwrap();
+        assert_eq!(next_announcement(&mut announcements).await, Some(said("Node 1 0 0 2 2 connected.")));
+        second.handle.run_action(&action(None, Some("10021"))).await.unwrap();
+        assert_eq!(next_announcement(&mut announcements).await, Some(said("Node 1 0 0 2 2 disconnected.")));
+        assert!(tokio::time::timeout(Duration::from_millis(500), announcements.recv()).await.is_err(), "a disconnect was announced twice");
     }
 
     #[test]

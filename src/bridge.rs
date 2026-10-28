@@ -1,4 +1,4 @@
-// Bridge between D-STAR voice and the AllStar node's audio, vocoding through an AMBEserver
+// Bridge between D-STAR voice and the AllStar node's audio, and the voice that makes announcements, vocoding through an AMBEserver
 
 use crate::allstar::Audio;
 use crate::config::{Allstar, Station};
@@ -37,6 +37,9 @@ const ENCODER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 // AMBEserver forgets idle clients (60s by default), so the rate is re-sent well before that
 const AMBESERVER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
+// Shown as the announcement's "name" on radios that display it
+const ANNOUNCEMENT_SUFFIX: &str = "INFO";
 
 const SYNC_SLOW_DATA: [u8; 3] = [0x55, 0x2D, 0x16];
 const NULL_SLOW_DATA: [u8; 3] = [0x16, 0x29, 0xF5];
@@ -115,10 +118,18 @@ async fn open_vocoder(address: SocketAddr) -> anyhow::Result<UdpSocket> {
     Ok(socket)
 }
 
+// What's being sent out over D-STAR. Announcements are only for the local radio, so they take their own route
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Origin {
+    Node,
+    Speech,
+}
+
 struct Bridge {
     allstar: Allstar,
     station: Station,
     to_gateway: mpsc::Sender<Frame>,
+    to_announcer: mpsc::Sender<Frame>,
     shared: Shared,
     to_node: mpsc::Sender<Audio>,
     vocoder_address: SocketAddr,
@@ -136,6 +147,7 @@ struct Bridge {
 
     // AllStar -> D-STAR stream state
     outbound_active: bool,
+    outbound_origin: Origin,
     outbound_sequence: u8,
     outbound_last_heard: Instant,
     outbound_ending_since: Option<Instant>,
@@ -163,6 +175,14 @@ impl Bridge {
 
     async fn send_to_node(&mut self, audio: Audio) {
         let _ = self.to_node.send(audio).await;
+    }
+
+    async fn send_outbound(&self, frame: Frame) {
+        let sender = match self.outbound_origin {
+            Origin::Node => &self.to_gateway,
+            Origin::Speech => &self.to_announcer,
+        };
+        let _ = sender.send(frame).await;
     }
 
     // ---- D-STAR side ----
@@ -199,25 +219,25 @@ impl Bridge {
 
     // ---- AllStar side ----
 
-    async fn handle_node_audio(&mut self, audio: Audio) {
-        // The end marker closes the AllStar transmission
+    async fn handle_outbound_audio(&mut self, audio: Audio, origin: Origin) {
+        // The end marker closes the transmission
         let audio = match audio {
             Audio::Voice(audio) if audio.len() == AUDIO_FRAME_BYTES => audio,
             _ => {
-                if self.outbound_active && self.outbound_ending_since.is_none() {
+                if self.outbound_active && self.outbound_origin == origin && self.outbound_ending_since.is_none() {
                     self.outbound_ending_since = Some(Instant::now());
                 }
                 return;
             }
         };
 
-        // D-STAR has the channel, so drop AllStar audio
-        if self.inbound_active {
+        // D-STAR has the channel, or something else is already being sent, so drop this audio
+        if self.inbound_active || (self.outbound_active && self.outbound_origin != origin) {
             return;
         }
         if self.vocoder.is_none() {
             if !self.warned_no_vocoder_outbound {
-                log::warn!("No vocoder attached, dropping AllStar audio");
+                log::warn!("No vocoder attached, dropping {origin:?} audio");
                 self.warned_no_vocoder_outbound = true;
             }
             return;
@@ -225,14 +245,16 @@ impl Bridge {
 
         // Open a new D-STAR stream on the first frame
         if !self.outbound_active {
-            log::info!("AllStar -> D-STAR: start of transmission");
+            log::info!("{} -> D-STAR: start of transmission", if origin == Origin::Node { "AllStar" } else { "Announcement" });
             self.outbound_active = true;
+            self.outbound_origin = origin;
             self.outbound_sequence = 0;
             self.outbound_pending_encodes = 0;
             let repeater_1 = format!("{:<7}{}", self.station.callsign, self.station.module);
             let repeater_2 = format!("{:<7}G", self.station.callsign);
-            let header = Header { flags: [0; 3], repeater_2: pad(&repeater_2), repeater_1: pad(&repeater_1), your_call: pad("CQCQCQ"), my_call: pad(&self.station.callsign), my_suffix: pad(&self.allstar.suffix) };
-            let _ = self.to_gateway.send(Frame::Header(header)).await;
+            let suffix = if origin == Origin::Node { self.allstar.suffix.as_str() } else { ANNOUNCEMENT_SUFFIX };
+            let header = Header { flags: [0; 3], repeater_2: pad(&repeater_2), repeater_1: pad(&repeater_1), your_call: pad("CQCQCQ"), my_call: pad(&self.station.callsign), my_suffix: pad(suffix) };
+            self.send_outbound(Frame::Header(header)).await;
         }
         self.outbound_last_heard = Instant::now();
         self.outbound_ending_since = None;
@@ -258,7 +280,7 @@ impl Bridge {
                 self.outbound_pending_encodes = self.outbound_pending_encodes.saturating_sub(1);
                 if self.outbound_active {
                     let slow_data = self.slow_data_blocks[self.outbound_sequence as usize];
-                    let _ = self.to_gateway.send(Frame::Voice { sequence: self.outbound_sequence, ambe: payload[2..11].try_into().unwrap(), slow_data }).await;
+                    self.send_outbound(Frame::Voice { sequence: self.outbound_sequence, ambe: payload[2..11].try_into().unwrap(), slow_data }).await;
                     self.outbound_sequence = (self.outbound_sequence + 1) % FRAMES_PER_SUPERFRAME;
                 }
             }
@@ -301,11 +323,11 @@ impl Bridge {
             }
             if let Some(since) = self.outbound_ending_since {
                 if self.outbound_pending_encodes == 0 || now.duration_since(since) > ENCODER_DRAIN_TIMEOUT {
-                    log::info!("AllStar -> D-STAR: end of transmission");
+                    log::info!("{} -> D-STAR: end of transmission", if self.outbound_origin == Origin::Node { "AllStar" } else { "Announcement" });
                     self.outbound_active = false;
                     self.outbound_ending_since = None;
                     self.warned_no_vocoder_outbound = false;
-                    let _ = self.to_gateway.send(Frame::End).await;
+                    self.send_outbound(Frame::End).await;
                 }
             }
         }
@@ -313,7 +335,8 @@ impl Bridge {
 }
 
 // Run the bridge, taking D-STAR frames from the gateway and handing back AllStar-originated ones
-pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_gateway: mpsc::Receiver<Frame>, to_gateway: mpsc::Sender<Frame>, mut from_node: mpsc::Receiver<Audio>, to_node: mpsc::Sender<Audio>) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_gateway: mpsc::Receiver<Frame>, to_gateway: mpsc::Sender<Frame>, mut from_node: mpsc::Receiver<Audio>, to_node: mpsc::Sender<Audio>, mut from_speech: mpsc::Receiver<Audio>, to_announcer: mpsc::Sender<Frame>) -> anyhow::Result<()> {
     let vocoder_address = lookup_host(allstar.ambeserver.as_str()).await?.next().context("couldn't resolve the AMBEserver address")?;
 
     let now = Instant::now();
@@ -325,6 +348,7 @@ pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_ga
         allstar,
         station,
         to_gateway,
+        to_announcer,
         shared,
         to_node,
         vocoder_address,
@@ -335,6 +359,7 @@ pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_ga
         inbound_last_heard: now,
         warned_no_vocoder_inbound: false,
         outbound_active: false,
+        outbound_origin: Origin::Node,
         outbound_sequence: 0,
         outbound_last_heard: now,
         outbound_ending_since: None,
@@ -353,9 +378,10 @@ pub async fn run(allstar: Allstar, station: Station, shared: Shared, mut from_ga
         };
         tokio::select! {
             audio = from_node.recv() => match audio {
-                Some(audio) => bridge.handle_node_audio(audio).await,
+                Some(audio) => bridge.handle_outbound_audio(audio, Origin::Node).await,
                 None => return Ok(()),
             },
+            Some(audio) = from_speech.recv() => bridge.handle_outbound_audio(audio, Origin::Speech).await,
             received = vocoder_ready => {
                 if let Ok(length) = received {
                     let data = vocoder_buffer[..length].to_vec();
@@ -381,6 +407,72 @@ mod tests {
         assert_eq!(blocks.len(), 21);
         assert_eq!(blocks[..9], [[0x55, 0x2D, 0x16], [0x30, 0x0E, 0xFF], [0x1C, 0x1C, 0xE7], [0x31, 0x2E, 0xE1], [0x50, 0x7A, 0xA7], [0x32, 0x7D, 0xA3], [0x47, 0x6F, 0xB3], [0x33, 0x6F, 0xB3], [0x50, 0x6F, 0xB3]]);
         assert!(blocks[9..].iter().all(|block| *block == NULL_SLOW_DATA));
+    }
+
+    // An AMBEserver that answers its setup requests, and turns every frame of speech into one frame of AMBE
+    async fn fake_vocoder() -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut buffer, mut counter) = ([0u8; 2048], 0u8);
+            while let Ok((length, peer)) = socket.recv_from(&mut buffer).await {
+                let reply: Vec<u8> = match (buffer[3], buffer[4], length) {
+                    (AMBE_TYPE_CONTROL, 0x33, _) => vec![0x61, 0x00, 0x02, 0x00, AMBE_PKT_READY, 0x00],
+                    (AMBE_TYPE_CONTROL, AMBE_PKT_PRODID, _) => vec![0x61, 0x00, 0x06, 0x00, AMBE_PKT_PRODID, b'F', b'A', b'K', b'E', 0x00],
+                    (AMBE_TYPE_CONTROL, AMBE_PKT_RATEP, _) => vec![0x61, 0x00, 0x02, 0x00, AMBE_PKT_RATEP, 0x00],
+                    (AMBE_TYPE_SPEECH, _, _) => {
+                        counter = counter.wrapping_add(1);
+                        [&AMBE_CHANNEL_HEADER[..], &[counter; 9]].concat()
+                    }
+                    _ => continue,
+                };
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn announcements_are_vocoded_and_sent_to_the_local_radio_only() {
+        let vocoder = fake_vocoder().await;
+        let allstar: Allstar = toml::from_str(&format!("node = 12345\nambeserver = \"{vocoder}\"")).unwrap();
+        let station: Station = toml::from_str("callsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0").unwrap();
+        let shared = Shared::default();
+        let (_gateway_sender, from_gateway) = mpsc::channel(16);
+        let (to_gateway, mut gateway_receiver) = mpsc::channel(256);
+        let (_node_sender, from_node) = mpsc::channel(16);
+        let (to_node, _node_receiver) = mpsc::channel(256);
+        let (speech_sender, from_speech) = mpsc::channel(256);
+        let (to_announcer, mut announcer_receiver) = mpsc::channel(256);
+        tokio::spawn(run(allstar, station, shared.clone(), from_gateway, to_gateway, from_node, to_node, from_speech, to_announcer));
+        for _ in 0..200 {
+            if state::read(&shared).vocoder_connected == Some(true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Speak ten frames, which come out as an announcement transmission on the local route
+        for _ in 0..10 {
+            speech_sender.send(Audio::Voice(vec![0; AUDIO_FRAME_BYTES])).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        speech_sender.send(Audio::End).await.unwrap();
+        let mut frames = Vec::new();
+        while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(3), announcer_receiver.recv()).await {
+            let finished = frame == Frame::End;
+            frames.push(frame);
+            if finished {
+                break;
+            }
+        }
+        let Some(Frame::Header(header)) = frames.first() else { panic!("no header first: {frames:?}") };
+        assert_eq!((header.my_call_text(), header.your_call), ("N0CALL/INFO".to_string(), pad("CQCQCQ")));
+        assert_eq!(frames.iter().filter(|frame| matches!(frame, Frame::Voice { .. })).count(), 10);
+        assert_eq!(frames.last(), Some(&Frame::End));
+
+        // None of it went down the route that reaches the reflector
+        assert!(gateway_receiver.try_recv().is_err(), "an announcement was sent where the reflector would hear it");
     }
 
     #[test]

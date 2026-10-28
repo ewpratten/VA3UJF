@@ -71,7 +71,7 @@
   </div>
 </main>
 <script>
-  const sources = { rf: "RF", reflector: "Reflector", allstar: "AllStar" };
+  const sources = { rf: "RF", reflector: "Reflector", allstar: "AllStar", announcement: "Announcement" };
   const flag = (value, good, bad) => value === null ? "Off" : value ? `<span class="good">${good}</span>` : `<span class="bad">${bad}</span>`;
   const text = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 

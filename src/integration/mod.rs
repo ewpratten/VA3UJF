@@ -2,6 +2,7 @@
 
 mod asl3;
 mod dstar;
+mod voice;
 
 use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};

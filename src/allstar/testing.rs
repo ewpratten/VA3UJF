@@ -1,6 +1,7 @@
 // Fixtures for tests that run a whole node, with the channels a bridge would hold
 
 use super::{channel, run, Audio, Handle};
+use crate::speech::Speaker;
 use crate::config::{Allstar, Station};
 use crate::state::{self, Shared};
 use std::time::Duration;
@@ -18,6 +19,11 @@ pub struct TestNode {
 
 // A node on a local port that reaches each peer at a fixed "host:port"
 pub fn start_node(node: u32, port: u16, peers: &[(u32, String)]) -> TestNode {
+    start_node_speaking(node, port, peers, None)
+}
+
+// The same, with announcements going to a speaker
+pub fn start_node_speaking(node: u32, port: u16, peers: &[(u32, String)], speaker: Option<Speaker>) -> TestNode {
     let peer_table: String = peers.iter().map(|(peer, address)| format!("\"{peer}\" = \"{address}\"\n")).collect();
     let allstar: Allstar = toml::from_str(&format!("node = {node}\nambeserver = \"127.0.0.1:2460\"\niax_port = {port}\npark_reflector = false\n[nodes]\n{peer_table}")).unwrap();
     let station: Station = toml::from_str("callsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0").unwrap();
@@ -27,7 +33,7 @@ pub fn start_node(node: u32, port: u16, peers: &[(u32, String)]) -> TestNode {
     let (to_node, from_bridge) = mpsc::channel(256);
     let (to_bridge, from_node) = mpsc::channel(256);
     let (reflector_commands, _unused) = mpsc::channel(4);
-    tokio::spawn(run(allstar, station, shared.clone(), reflector_commands, from_bridge, to_bridge, commands));
+    tokio::spawn(run(allstar, station, shared.clone(), reflector_commands, speaker, from_bridge, to_bridge, commands));
     TestNode { handle, shared, to_node, from_node }
 }
 

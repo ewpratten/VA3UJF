@@ -12,6 +12,7 @@ pub struct Config {
     pub aprs: Option<Aprs>,
     pub allstar: Option<Allstar>,
     pub hosts: Option<Hosts>,
+    pub speech: Option<Speech>,
     #[serde(default, rename = "reflector")]
     pub reflectors: Vec<Reflector>,
     pub startup_reflector: Option<String>,
@@ -84,6 +85,18 @@ pub struct Allstar {
     pub tx_gain_db: f32,
 }
 
+// Spoken announcements, made by a Piper voice running inside this program and vocoded through the AllStar section's AMBEserver
+#[derive(Deserialize, Clone)]
+pub struct Speech {
+    // Holds the voice's .onnx model, its tokens.txt, and its espeak-ng-data
+    #[serde(default = "default_voice_directory")]
+    pub voice_directory: PathBuf,
+    #[serde(default = "default_speech_speed")]
+    pub speed: f32,
+    #[serde(default = "default_speech_threads")]
+    pub threads: i32,
+}
+
 // Lets other nodes find this one. The node's password is read from a file, to keep it out of the configuration
 #[derive(Deserialize, Clone)]
 pub struct Registration {
@@ -149,6 +162,9 @@ pub struct Hosts {
     pub refresh_hours: u64,
 }
 
+fn default_voice_directory() -> PathBuf { PathBuf::from("/usr/share/va3ujf/voice") }
+fn default_speech_speed() -> f32 { 1.0 }
+fn default_speech_threads() -> i32 { 2 }
 fn default_iax_port() -> u16 { 4569 }
 fn default_dns_domain() -> String { "nodes.allstarlink.org".to_string() }
 fn default_park_reflector() -> bool { true }
@@ -172,6 +188,9 @@ impl Config {
         if let Some(allstar) = &config.allstar {
             crate::allstar::validate_schedule(&allstar.schedule)?;
         }
+        if config.speech.is_some() && config.allstar.is_none() {
+            anyhow::bail!("speech needs an [allstar] section, since announcements are vocoded through its AMBEserver");
+        }
         Ok(config)
     }
 
@@ -179,6 +198,15 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speech_without_an_allstar_section_is_refused() {
+        let path = std::env::temp_dir().join(format!("va3ujf-speech-only-{}.toml", std::process::id()));
+        std::fs::write(&path, "[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0\n[modem]\nport = \"/dev/null\"\n[speech]\n").unwrap();
+        let error = super::Config::load(&path).err().expect("speech alone to be refused");
+        std::fs::remove_file(&path).ok();
+        assert!(format!("{error:#}").contains("[allstar]"), "{error:#}");
+    }
+
     #[test]
     fn example_config_parses_and_validates() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("example.toml");

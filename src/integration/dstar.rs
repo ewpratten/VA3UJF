@@ -5,6 +5,7 @@ use super::{build_image, container_assets, containers_available, Container, Netw
 use crate::config::Config;
 use crate::dstar::{pad, Frame, Header};
 use crate::reflector::{self, Command};
+use crate::speech::Announcement;
 use crate::{hosts, state};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -96,7 +97,8 @@ async fn our_reflector_client_trades_voice_with_a_real_dstargateway() {
     let (commands, command_receiver) = mpsc::channel(4);
     let (from_reflector_sender, mut from_reflector) = mpsc::channel(256);
     let (to_reflector, to_reflector_receiver) = mpsc::channel(256);
-    tokio::spawn(reflector::run(config, directory, command_receiver, from_reflector_sender, to_reflector_receiver, shared.clone()));
+    let (speaker, mut announcements) = mpsc::channel(8);
+    tokio::spawn(reflector::run(config, directory, command_receiver, from_reflector_sender, to_reflector_receiver, shared.clone(), Some(speaker)));
     commands.send(Command::Link { name: REFLECTOR_NAME.into(), module: 'B' }).await.unwrap();
     let mut linked = false;
     for _ in 0..100 {
@@ -107,6 +109,9 @@ async fn our_reflector_client_trades_voice_with_a_real_dstargateway() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(linked, "never linked to the gateway. Gateway logs:\n{}", gateway.logs());
+
+    // The link is announced out loud
+    assert_eq!(announcements.try_recv().ok(), Some(Announcement::Text("Linked to reflector N 0 G A T E, module Bravo.".into())));
 
     // The gateway announces the new link on both sides, and we want that done before our own voice goes through
     tokio::time::sleep(Duration::from_secs(5)).await;
