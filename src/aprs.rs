@@ -27,21 +27,14 @@ pub fn passcode(callsign: &str) -> i32 {
     hash & 0x7fff
 }
 
-fn beacon_text(station: &Station, aprs: &Aprs) -> String {
-    format!(
-        "{}-{}>APZVA3,TCPIP*:!{}/{}-D-STAR hotspot {:.4}MHz\r\n",
-        station.callsign,
-        aprs.ssid,
-        coordinate(station.latitude, 'N', 'S', 2),
-        coordinate(station.longitude, 'E', 'W', 3),
-        station.frequency_mhz
-    )
+fn beacon_text(station: &Station) -> String {
+    format!("{0}>APZVA3,TCPIP*:!{1}/{2}-{0} Homebrew Repeater\r\n", station.callsign, coordinate(station.latitude, 'N', 'S', 2), coordinate(station.longitude, 'E', 'W', 3))
 }
 
 async fn session(station: &Station, aprs: &Aprs, shared: &Shared, reports: &mut mpsc::Receiver<String>) -> anyhow::Result<()> {
     let stream = TcpStream::connect(&aprs.server).await?;
     let (reader, mut writer) = stream.into_split();
-    let igate = format!("{}-{}", station.callsign, aprs.ssid);
+    let igate = station.callsign.clone();
     let login = format!("user {igate} pass {} vers va3ujf 0.1\r\n", passcode(&station.callsign));
     writer.write_all(login.as_bytes()).await?;
     log::info!("Connected to APRS-IS at {} as {igate}", aprs.server);
@@ -54,7 +47,7 @@ async fn session(station: &Station, aprs: &Aprs, shared: &Shared, reports: &mut 
         tokio::select! {
             _ = beacon_timer.tick() => {
                 log::debug!("Beaconing position");
-                writer.write_all(beacon_text(station, aprs).as_bytes()).await?;
+                writer.write_all(beacon_text(station).as_bytes()).await?;
             }
             Some(report) = reports.recv() => match dprs::gate(&report, &igate) {
                 Some(packet) => {
@@ -86,6 +79,13 @@ pub async fn run(station: Station, aprs: Aprs, shared: Shared, mut reports: mpsc
 
 #[cfg(test)]
 mod tests {
+    use crate::config::Station;
+    #[test]
+    fn beacon_is_sent_as_the_bare_callsign() {
+        let station: Station = toml::from_str("callsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.5\nlongitude = -90.25").unwrap();
+        assert_eq!(super::beacon_text(&station), "N0CALL>APZVA3,TCPIP*:!4530.00N/09015.00W-N0CALL Homebrew Repeater\r\n");
+    }
+
     #[test]
     fn passcode_matches_the_known_hash() {
         assert_eq!(super::passcode("N0CALL"), 13023);
