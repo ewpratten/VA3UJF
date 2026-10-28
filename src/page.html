@@ -40,6 +40,18 @@
 
   .meter { display: inline-block; vertical-align: middle; width: 120px; height: 10px; border-radius: 5px; background: var(--meter); overflow: hidden; }
   .meter > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--good), var(--talk-line), var(--bad)); background-size: 120px 100%; transition: width .15s ease-out; }
+  #flow { width: 100%; height: auto; display: block; }
+  #flow text { fill: var(--text); font-size: 13px; }
+  #flow text.muted { fill: var(--muted); }
+  #flow .node { fill: var(--muted); }
+  #flow .node.talking { fill: var(--talk-line); }
+  #flow .ribbon { fill: var(--accent); fill-opacity: .4; }
+  #flow .ribbon.out { fill-opacity: .2; }
+  #flow .ribbon.in { fill: var(--talk-line); fill-opacity: .45; }
+  #flow .ribbon.live { animation: flow-pulse 1s ease-in-out infinite; }
+  @keyframes flow-pulse { 50% { fill-opacity: .8; } }
+  @media (prefers-reduced-motion: reduce) { #flow .ribbon.live { animation: none; fill-opacity: .7; } }
+  .legend { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
   #peers tbody tr { cursor: default; }
   #peers tbody tr.has-fix { cursor: pointer; }
   #peers tbody tr.talking { background: var(--talk); box-shadow: inset 3px 0 0 var(--talk-line); }
@@ -47,17 +59,8 @@
   #peers td.data { font-family: ui-monospace, monospace; font-size: 13px; min-width: 21ch; white-space: pre; }
   .caret { display: inline-block; width: .5em; margin-left: 1px; background: var(--talk-line); animation: blink 1s steps(1) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
-  #peers .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
-  #peers tr.talking .dot { background: var(--talk-line); animation: pulse 1s ease-in-out infinite; }
-  @keyframes pulse { 50% { opacity: .3; } }
-  @media (prefers-reduced-motion: reduce) { #peers tr.talking .dot, .caret { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .caret { animation: none; } }
 
-  #slowdata { max-height: 240px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 13px; }
-  #slowdata div { padding: 2px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; }
-  #slowdata time { color: var(--muted); flex: none; }
-  #slowdata b { flex: none; }
-  #slowdata .kind { flex: none; color: var(--muted); min-width: 6.5em; }
-  #slowdata span.value { white-space: pre-wrap; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -68,13 +71,14 @@
   <div class="card flush"><div id="map"></div></div>
 
   <div class="card">
-    <h2>Peers</h2>
-    <div class="scroll"><table id="peers"><thead><tr><th></th><th>Callsign</th><th>Via</th><th>Signal</th><th>BER</th><th>Data</th><th>Last heard</th><th>Talked</th></tr></thead><tbody></tbody></table></div>
+    <h2>Traffic</h2>
+    <svg id="flow" viewBox="0 0 900 300" role="img" aria-label="Voice traffic between RF stations, the repeater and its links"></svg>
+    <p class="legend">Voice over the last five minutes. Blue is what the repeater heard on RF and passed to the links, and amber is what came in from the links.</p>
   </div>
 
   <div class="card">
-    <h2>Slow data</h2>
-    <div id="slowdata"><div class="muted">Waiting for a transmission…</div></div>
+    <h2>Peers</h2>
+    <div class="scroll"><table id="peers"><thead><tr><th>Name</th><th>Via</th><th>Level</th><th>BER</th><th>Data</th><th>Last heard</th><th>Keyups</th></tr></thead><tbody></tbody></table></div>
   </div>
 
   <div class="card">
@@ -106,16 +110,20 @@
 <script>
   const STATION = { latitude: {{latitude}}, longitude: {{longitude}}, callsign: "{{callsign}}" };
   const SOURCES = { rf: "RF", reflector: "Reflector", allstar: "AllStar node", announcement: "Announcement", ack: "Repeater" };
-  const SLOW_DATA_LINES = 80;
-  const SIGNAL_STALE_MS = 1500;
-  const DBM_RANGE = [-120, -40];
-
+  
   const sourceName = (source) => SOURCES[source] ?? source;
   const text = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
   const byId = (id) => document.getElementById(id);
 
+  // Replacing what's on the page under someone's finger loses their click, so it's only done when there's something new to show, and not while a button inside is being pressed
+  const shown = new WeakMap();
+  function setHtml(element, html) {
+    if (shown.get(element) === html || element.querySelector(":active")) return;
+    element.innerHTML = html;
+    shown.set(element, html);
+  }
+
   let snapshot = null;
-  let signal = null;
 
   // ---- Time ----
 
@@ -123,31 +131,26 @@
   const duration = (seconds) => seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
   const secondsSince = (unix) => Math.max(0, Math.floor(Date.now() / 1000) - unix);
 
-  // ---- Signal ----
+  // ---- Level ----
 
-  // Quiet is the left of the bar and loud is the right. A calibrated modem gives dBm to scale by. Otherwise the raw readings are scaled against the range heard so far
-  const rawRange = { low: Infinity, high: -Infinity };
-  const MIN_RAW_SPAN = 50;
+  // How loud the voice is, from quiet on the left to loud on the right. It comes from decoding the voice, so every kind of peer has one
+  const LEVEL_RANGE_DBFS = [-50, -10];
+  const LEVEL_STALE_MS = 800;
+  const levels = new Map();
 
-  function signalFill() {
-    if (!signal) return 0;
-    if (signal.dbm !== null) return Math.max(0, Math.min(1, (signal.dbm - DBM_RANGE[0]) / (DBM_RANGE[1] - DBM_RANGE[0])));
-    const span = rawRange.high - rawRange.low;
-    return span < MIN_RAW_SPAN ? 0.5 : (signal.raw - rawRange.low) / span;
+  const levelKey = (peer) => peer.via === "allstar" ? "source:allstar" : `call:${peer.callsign}`;
+
+  function levelFill(key) {
+    const level = levels.get(key);
+    if (!level || Date.now() - level.at > LEVEL_STALE_MS) return 0;
+    return Math.max(0, Math.min(1, (level.dbfs - LEVEL_RANGE_DBFS[0]) / (LEVEL_RANGE_DBFS[1] - LEVEL_RANGE_DBFS[0])));
   }
 
-  const signalFresh = () => signal && Date.now() - signal.at <= SIGNAL_STALE_MS;
-
-  function signalHtml(show) {
-    if (!show || !signalFresh()) return '<span class="muted">—</span>';
-    return `<span class="meter" data-meter><i style="width:${(signalFill() * 100).toFixed(0)}%"></i></span>`;
-  }
+  const levelHtml = (peer) => peer.talking ? `<span class="meter" data-meter="${text(levelKey(peer))}"><i style="width:${(levelFill(levelKey(peer)) * 100).toFixed(0)}%"></i></span>` : '<span class="muted">—</span>';
 
   // Move the bars that are already on the page, so they glide rather than being redrawn
   function moveMeters() {
-    const meters = document.querySelectorAll("[data-meter] > i");
-    meters.forEach((bar) => { bar.style.width = `${(signalFill() * 100).toFixed(0)}%`; });
-    return meters.length > 0;
+    document.querySelectorAll("[data-meter]").forEach((meter) => { meter.firstElementChild.style.width = `${(levelFill(meter.dataset.meter) * 100).toFixed(0)}%`; });
   }
 
   // ---- Map ----
@@ -223,15 +226,14 @@
 
   function renderPeers() {
     const peers = [...snapshot.peers].sort((a, b) => b.talking - a.talking || b.last_heard - a.last_heard);
-    byId("peers").tBodies[0].innerHTML = peers.length ? peers.map((peer) => `<tr class="${peer.talking ? "talking" : ""}${peer.fix ? " has-fix" : ""}${peer.linked === false ? " offline" : ""}" data-callsign="${text(peer.callsign)}">
-      <td><span class="dot"></span></td>
+    setHtml(byId("peers").tBodies[0], peers.length ? peers.map((peer) => `<tr class="${peer.talking ? "talking" : ""}${peer.fix ? " has-fix" : ""}${peer.linked === false ? " offline" : ""}" data-callsign="${text(peer.callsign)}">
       <td><b>${text(peer.callsign)}</b></td>
       <td>${sourceName(peer.via)}${peer.linked === false ? " (unlinked)" : ""}</td>
-      <td>${signalHtml(peer.talking && peer.via === "rf")}</td>
+      <td>${levelHtml(peer)}</td>
       <td>${peer.ber_percent === null ? '<span class="muted">—</span>' : peer.ber_percent.toFixed(1) + "%"}</td>
       <td class="data" data-ticker="${text(peer.callsign)}">${tickerHtml(peer)}</td>
       <td data-last-heard="${peer.last_heard}">${peer.talking ? "talking" : age(secondsSince(peer.last_heard))}</td>
-      <td>${peer.transmissions}× · ${duration(peer.seconds)}</td></tr>`).join("") : '<tr><td></td><td class="muted" colspan="7">Nobody heard yet</td></tr>';
+      <td title="${duration(peer.seconds)} on the air">${peer.transmissions}</td></tr>`).join("") : '<tr><td class="muted" colspan="7">Nobody heard yet</td></tr>');
     snapshot.peers.forEach(placePeer);
   }
 
@@ -240,63 +242,161 @@
     if (peer?.fix && map.instance) { map.touched = true; map.instance.flyTo([peer.fix.latitude, peer.fix.longitude], Math.max(map.instance.getZoom(), 11)); }
   });
 
-  // ---- Slow data ----
-
-  const textLines = new Map();
-
+  // The text a station is sending fills in on its row as it arrives
   function slowData(event) {
-    if (event.kind === "text") {
-      const ticker = tickers.get(event.callsign);
-      if (ticker) ticker.target = event.text;
-    }
-    const log = byId("slowdata");
-    if (!log.querySelector("time")) log.innerHTML = "";
-    const stamp = new Date().toLocaleTimeString();
+    const ticker = event.kind === "text" ? tickers.get(event.callsign) : null;
+    if (ticker) ticker.target = event.text;
+  }
 
-    // A text message fills in as it arrives, so it's updated in place for as long as it's the latest thing from that station
-    const previous = event.kind === "text" ? textLines.get(event.callsign) : null;
-    if (previous && previous.parentNode === log && previous === log.firstElementChild) {
-      previous.querySelector("time").textContent = stamp;
-      previous.querySelector(".value").textContent = event.text;
-      return;
+  // ---- Traffic ----
+
+  const FLOW_WINDOW_SECONDS = 300;
+  const FLOW_SOURCES = ["rf", "reflector", "allstar"];
+  const FLOW_STATIONS_SHOWN = 10;
+  const FLOW = { width: 900, height: 300, padding: 22, nodeWidth: 12, leftX: 170, middleX: 444, rightX: 718, minNode: 16, gap: 10, floorUnits: 10 };
+  let history = [];
+
+  // How much of a transmission falls inside the window, counting one still going as far as it has got
+  function secondsInWindow(transmission, now) {
+    const end = Math.min(now, transmission.started_at + transmission.seconds);
+    return Math.max(0, end - Math.max(transmission.started_at, now - FLOW_WINDOW_SECONDS));
+  }
+
+  // Who has talked to the repeater, and what each connection on the other side has sent and been sent. A reflector is one connection, and so is each node linked into AllStar
+  function flowModel(now) {
+    // Only what's said by RF stations and reflectors is in the router's current transmission. Each AllStar node is followed from the peer list
+    const current = snapshot.current && ["rf", "reflector"].includes(snapshot.current.source) ? [{ ...snapshot.current, seconds: now - snapshot.current.started_at, live: true }] : [];
+    const nodesTalking = snapshot.peers.filter((peer) => peer.via === "allstar" && peer.talking && peer.talking_since).map((peer) => ({ source: "allstar", callsign: peer.callsign, started_at: peer.talking_since, seconds: now - peer.talking_since, live: true }));
+    const recent = history.filter((transmission) => FLOW_SOURCES.includes(transmission.source)).map((transmission) => ({ ...transmission, live: false })).concat(current, nodesTalking)
+      .map((transmission) => ({ ...transmission, inWindow: secondsInWindow(transmission, now) })).filter((transmission) => transmission.inWindow > 0);
+
+    const left = new Map();
+    recent.filter((transmission) => transmission.source === "rf").forEach((transmission) => {
+      const station = left.get(transmission.callsign) ?? { name: transmission.callsign, seconds: 0, weight: 1, talking: false };
+      station.seconds += transmission.inWindow;
+      station.talking ||= transmission.live;
+      left.set(transmission.callsign, station);
+    });
+
+    const connections = [];
+    snapshot.links.filter((link) => link.connected && FLOW_SOURCES.includes(link.kind)).forEach((link) => {
+      if (link.kind === "allstar") link.peers.filter((peer) => peer.connected).forEach((peer) => connections.push({ name: `AllStar ${peer.id}`, owns: (transmission) => transmission.source === "allstar" && transmission.callsign === peer.id }));
+      else connections.push({ name: link.target ?? link.kind, owns: (transmission) => transmission.source === link.kind });
+    });
+    const total = recent.reduce((sum, transmission) => sum + transmission.inWindow, 0);
+    const links = connections.map((connection) => {
+      const heard = recent.filter(connection.owns);
+      const received = heard.reduce((sum, transmission) => sum + transmission.inWindow, 0);
+      return { name: connection.name, talking: heard.some((transmission) => transmission.live), received, sent: total - received, receivedWeight: received > 0 ? 1 : 0, sentWeight: total - received > 0 ? 1 : 0, liveSources: recent.some((transmission) => transmission.live && !connection.owns(transmission)) };
+    });
+    const stations = [...left.values()].sort((a, b) => b.seconds - a.seconds);
+
+    // A busy repeater would otherwise need a chart too tall to read
+    if (stations.length > FLOW_STATIONS_SHOWN) {
+      const others = stations.splice(FLOW_STATIONS_SHOWN - 1);
+      stations.push({ name: `${others.length} others`, seconds: others.reduce((sum, station) => sum + station.seconds, 0), weight: 1, talking: others.some((station) => station.talking) });
     }
-    const line = document.createElement("div");
-    line.innerHTML = `<time>${stamp}</time><b>${text(event.callsign)}</b><span class="kind">${text(event.kind)}</span><span class="value">${text(event.text)}</span>`;
-    log.prepend(line);
-    if (event.kind === "text") textLines.set(event.callsign, line);
-    while (log.children.length > SLOW_DATA_LINES) log.lastElementChild.remove();
+    return { left: stations, links, repeater: STATION.callsign };
+  }
+
+  // Nodes and ribbons for the chart. Every flow is the same thickness, however long it has gone on, and voice is copied to every connection, so the right side can be taller than the left
+  function flowLayout(model) {
+    const { padding, nodeWidth, leftX, middleX, rightX, minNode, gap, floorUnits } = FLOW;
+
+    // The drawing grows if there are more rows than fit, so every node can keep its minimum size
+    const height = Math.max(FLOW.height, 2 * padding + Math.max(model.left.length, model.links.length) * (minNode + gap));
+    const leftTotal = model.left.reduce((sum, station) => sum + station.weight, 0);
+    const rightTotal = model.links.reduce((sum, link) => sum + link.receivedWeight + link.sentWeight, 0);
+    const room = height - 2 * padding;
+
+    // Pick a scale where both columns fit, with their gaps and the minimum size of a node
+    let scale = room / Math.max(leftTotal, rightTotal, floorUnits);
+    const columnHeight = (sizes) => sizes.reduce((sum, size) => sum + Math.max(minNode, size * scale), 0) + gap * Math.max(0, sizes.length - 1);
+    const leftSizes = model.left.map((station) => station.weight), rightSizes = model.links.map((link) => link.receivedWeight + link.sentWeight);
+    for (let attempt = 0; attempt < 8 && Math.max(columnHeight(leftSizes), columnHeight(rightSizes)) > room; attempt++) scale *= room / Math.max(columnHeight(leftSizes), columnHeight(rightSizes)) * 0.97;
+
+    const nodes = [], ribbons = [];
+    const stack = (sizes) => { let y = (height - columnHeight(sizes)) / 2; return sizes.map((size) => { const h = Math.max(minNode, size * scale); const top = y; y += h + gap; return { top, h }; }); };
+    const middleHeight = Math.max(minNode * 2, leftTotal * scale, rightTotal * scale);
+    const middleTop = (height - middleHeight) / 2;
+    const ribbon = (fromX, fromY, toX, toY, thickness, kind, live, title) => {
+      const t = Math.max(1.5, thickness), mid = (fromX + toX) / 2;
+      ribbons.push({ kind, live, title, path: `M${fromX},${fromY} C${mid},${fromY} ${mid},${toY} ${toX},${toY} L${toX},${toY + t} C${mid},${toY + t} ${mid},${fromY + t} ${fromX},${fromY + t} Z` });
+    };
+
+    // RF stations on the left, into the repeater
+    let intake = middleTop + (middleHeight - leftTotal * scale) / 2;
+    stack(leftSizes).forEach((slot, index) => {
+      const station = model.left[index], thickness = station.weight * scale;
+      nodes.push({ side: "left", x: leftX, y: slot.top, h: slot.h, label: station.name, talking: station.talking });
+      ribbon(leftX + nodeWidth, slot.top + (slot.h - Math.max(1.5, thickness)) / 2, middleX, intake, thickness, "rf", station.talking, `${station.name}: ${Math.round(station.seconds)}s`);
+      intake += thickness;
+    });
+
+    // Connections on the right, each with what's sent out to it and what comes in from it
+    let edge = middleTop + (middleHeight - rightTotal * scale) / 2;
+    stack(rightSizes).forEach((slot, index) => {
+      const link = model.links[index], outThickness = link.sentWeight * scale, inThickness = link.receivedWeight * scale;
+      const inner = slot.top + (slot.h - (outThickness + inThickness)) / 2;
+      nodes.push({ side: "right", x: rightX, y: slot.top, h: slot.h, label: link.name, talking: link.talking });
+      if (link.sentWeight > 0) ribbon(middleX + nodeWidth, edge, rightX, inner, outThickness, "out", link.liveSources, `To ${link.name}: ${Math.round(link.sent)}s`);
+      if (link.receivedWeight > 0) ribbon(middleX + nodeWidth, edge + outThickness, rightX, inner + outThickness, inThickness, "in", link.talking, `From ${link.name}: ${Math.round(link.received)}s`);
+      edge += outThickness + inThickness;
+    });
+    nodes.push({ side: "middle", x: middleX, y: middleTop, h: middleHeight, label: model.repeater, talking: model.left.some((station) => station.talking) || model.links.some((link) => link.talking) });
+    return { nodes, ribbons, height };
+  }
+
+  const clip = (label, length = 20) => label.length > length ? label.slice(0, length - 1) + "…" : label;
+
+  function renderFlow() {
+    if (!snapshot) return;
+    const model = flowModel(Date.now() / 1000);
+    const { nodes, ribbons, height } = flowLayout(model);
+    byId("flow").setAttribute("viewBox", `0 0 ${FLOW.width} ${height}`);
+    const labels = nodes.map((node) => {
+      const y = node.y + node.h / 2 + 4;
+      if (node.side === "left") return `<text x="${node.x - 8}" y="${y}" text-anchor="end">${text(clip(node.label))}</text>`;
+      if (node.side === "right") return `<text x="${node.x + FLOW.nodeWidth + 8}" y="${y}">${text(clip(node.label))}</text>`;
+      return `<text x="${node.x + FLOW.nodeWidth / 2}" y="${node.y - 8}" text-anchor="middle">${text(node.label)}</text>`;
+    });
+    const notes = [model.left.length ? "" : `<text class="muted" x="${FLOW.leftX - 8}" y="${height / 2 + 4}" text-anchor="end">No RF in the last 5 minutes</text>`, model.links.length ? "" : `<text class="muted" x="${FLOW.rightX + FLOW.nodeWidth + 8}" y="${height / 2 + 4}">No active links</text>`];
+    setHtml(byId("flow"), ribbons.map((ribbon) => `<path class="ribbon ${ribbon.kind}${ribbon.live ? " live" : ""}" d="${ribbon.path}"><title>${text(ribbon.title)}</title></path>`).join("")
+      + nodes.map((node) => `<rect class="node${node.talking ? " talking" : ""}" x="${node.x}" y="${node.y}" width="${FLOW.nodeWidth}" height="${node.h}" rx="2"></rect>`).join("") + labels.join("") + notes.join(""));
   }
 
   // ---- Everything else ----
 
   function renderLinks() {
     const reflector = snapshot.links.find((link) => link.kind === "reflector") ?? { target: null };
-    byId("link").innerHTML = !reflector.target ? "Not linked" : reflector.connected ? `<span class="good">Linked to ${text(reflector.target)}</span>` : `<span class="bad">Linking ${text(reflector.target)}…</span>`;
+    setHtml(byId("link"), !reflector.target ? "Not linked" : reflector.connected ? `<span class="good">Linked to ${text(reflector.target)}</span>` : `<span class="bad">Linking ${text(reflector.target)}…</span>`);
     const allstar = snapshot.allstar;
     byId("allstar-card").hidden = !allstar;
     if (!allstar) return;
     byId("allstar-node").textContent = allstar.node;
     const peers = (snapshot.links.find((link) => link.kind === "allstar") ?? { peers: [] }).peers;
     const peerState = (peer) => !peer.connected ? "Connecting…" : peer.keyed ? "Keyed" : "Idle";
-    byId("allstar-links").innerHTML = peers.length ? peers.map((peer) => `<tr><td>${text(peer.id)}</td><td>${peer.mode}, ${peer.outbound ? "outbound" : "inbound"}</td><td>${peerState(peer)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(peer.id)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>';
-    byId("allstar-schedule").innerHTML = allstar.schedule.map((run) => `<tr><td>${text(run.name)}</td><td>${new Date(run.next_at * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</td></tr>`).join("");
+    setHtml(byId("allstar-links"), peers.length ? peers.map((peer) => `<tr><td>${text(peer.id)}</td><td>${peer.mode}, ${peer.outbound ? "outbound" : "inbound"}</td><td>${peerState(peer)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(peer.id)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>');
+    setHtml(byId("allstar-schedule"), allstar.schedule.map((run) => `<tr><td>${text(run.name)}</td><td>${new Date(run.next_at * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</td></tr>`).join(""));
   }
 
   function render() {
     renderPeers();
     renderLinks();
+    renderFlow();
   }
 
   function handle(message) {
     switch (message.type) {
       case "snapshot": snapshot = message.snapshot; render(); break;
-      case "signal":
-        signal = { raw: message.raw, dbm: message.dbm, at: Date.now() };
-        rawRange.low = Math.min(rawRange.low, message.raw);
-        rawRange.high = Math.max(rawRange.high, message.raw);
-        if (snapshot && !moveMeters()) renderPeers();
+      case "level":
+        levels.set(`call:${message.callsign}`, { dbfs: message.dbfs, at: Date.now() });
+        levels.set(`source:${message.source}`, { dbfs: message.dbfs, at: Date.now() });
+        moveMeters();
         break;
       case "slow_data": slowData(message); break;
+      case "history": history = message.transmissions; renderFlow(); break;
+      case "transmission": history.push(message); renderFlow(); break;
       case "position": {
         const peer = snapshot?.peers.find((candidate) => candidate.callsign === message.callsign);
         if (peer) { peer.fix = { latitude: message.latitude, longitude: message.longitude, comment: message.comment }; placePeer(peer); }
@@ -319,9 +419,11 @@
   });
 
   // Keep times and the elapsed counter moving between updates
+  setInterval(moveMeters, 250);
+
   setInterval(() => {
     document.querySelectorAll("[data-last-heard]").forEach((cell) => { if (!cell.parentElement.classList.contains("talking")) cell.textContent = age(secondsSince(Number(cell.dataset.lastHeard))); });
-    if (signal && !signalFresh() && snapshot) { signal = null; renderPeers(); }
+    renderFlow();
   }, 1000);
 
   // The page stays live by reconnecting whenever the hotspot restarts or the network drops

@@ -5,6 +5,7 @@ use crate::codec::fec;
 use crate::dprs;
 use crate::dstar::{pad, Frame, Header};
 use crate::live::Event;
+use crate::meter;
 use crate::slowdata::{Decoded, Decoder};
 use crate::speech::{Announcement, Speaker};
 use crate::state::{self, Shared, Transmission};
@@ -47,6 +48,9 @@ pub struct Router {
 
     // The radio is always the first member
     members: Vec<Member>,
+
+    // Where the voice of every transmission goes to be measured, if anything is measuring
+    meter: Option<mpsc::Sender<meter::Input>>,
 }
 
 async fn deliver(members: &[Member], sender: usize, frame: &Frame) {
@@ -63,9 +67,13 @@ impl Router {
     // A router with the radio attached, and the radio's port
     pub fn new() -> (Self, Port) {
         let (inbox_sender, inbox) = mpsc::channel(PORT_DEPTH);
-        let mut router = Router { inbox, inbox_sender, members: Vec::new() };
+        let mut router = Router { inbox, inbox_sender, members: Vec::new(), meter: None };
         let radio = router.attach("rf", Scope::Everyone);
         (router, radio)
+    }
+
+    pub fn set_meter(&mut self, meter: mpsc::Sender<meter::Input>) {
+        self.meter = Some(meter);
     }
 
     // Connect a link, which is then named in the transmission log by its kind
@@ -96,7 +104,7 @@ impl Router {
 
     pub async fn run(self, mut taps: RadioTaps, shared: Shared) {
         // The router stops once every link has gone, which needs it to hold no handle on its own inbox
-        let Router { mut inbox, inbox_sender, members } = self;
+        let Router { mut inbox, inbox_sender, members, meter } = self;
         drop(inbox_sender);
         let mut events = shared.subscribe_events();
         let mut decoders: Vec<Decoder> = members.iter().map(|_| Decoder::default()).collect();
@@ -122,7 +130,7 @@ impl Router {
                 _ = tick.tick() => {
                     if active.as_ref().is_some_and(|holder| holder.heard.elapsed() > STREAM_TIMEOUT) {
                         active = None;
-                        state::update(&shared, state::finish_transmission);
+                        state::end_transmission(&shared);
                     }
                     continue;
                 }
@@ -135,7 +143,7 @@ impl Router {
             {
                 log::info!("Cutting off {} for someone keying up", members[holder].kind);
                 deliver(&members, holder, &Frame::End).await;
-                state::update(&shared, state::finish_transmission);
+                state::end_transmission(&shared);
                 active = None;
             }
 
@@ -151,6 +159,7 @@ impl Router {
 
             let kind = members[sender].kind;
             let tracked = members[sender].tracked;
+            let metered = members[sender].scope == Scope::Everyone;
             if let Frame::Header(header) = &frame {
                 let callsign = header.my_call_text();
                 log::info!("Heard {callsign} via {kind}");
@@ -170,6 +179,15 @@ impl Router {
             holder.heard = Instant::now();
             let callsign = holder.callsign.clone();
 
+            // Voice moving through the repeater is measured for how loud it is. If the meter can't keep up, it misses some
+            if let (true, Some(meter)) = (metered, &meter) {
+                let _ = match &frame {
+                    Frame::Header(_) => meter.try_send(meter::Input::Start),
+                    Frame::Voice { ambe, .. } => meter.try_send(meter::Input::Frame { source: kind, callsign: callsign.clone(), ambe: *ambe }),
+                    Frame::End => meter.try_send(meter::Input::End),
+                };
+            }
+
             // What's in the slow data, and how clean the voice is
             if let Frame::Voice { ambe, slow_data, .. } = &frame {
                 if sender == 0 {
@@ -185,7 +203,7 @@ impl Router {
 
             if matches!(frame, Frame::End) {
                 let finished = active.take();
-                state::update(&shared, state::finish_transmission);
+                state::end_transmission(&shared);
                 if let (0, false, Some(finished)) = (sender, for_repeater_only, finished) {
                     report_quality(&shared, &taps, &finished, &quality);
                 }
@@ -537,6 +555,55 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(300), requests.recv()).await.is_err(), "an info request was acknowledged");
         transmit(&radio.to_router, "CQCQCQ").await;
         assert!(requests.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn finished_voice_is_reported_for_the_flow_chart_but_announcements_are_not() {
+        let (mut router, radio) = Router::new();
+        let link = router.attach("reflector", Scope::Everyone);
+        let announcer = router.attach("announcement", Scope::LocalOnly);
+        let shared = Shared::default();
+        let mut events = shared.subscribe_events();
+        tokio::spawn(router.run(RadioTaps::default(), shared.clone()));
+
+        transmit(&announcer.to_router, "CQCQCQ").await;
+        transmit(&radio.to_router, "CQCQCQ").await;
+        transmit(&link.to_router, "CQCQCQ").await;
+        let mut sources = Vec::new();
+        while sources.len() < 2 {
+            let Event::Transmission { source, callsign, .. } = event(&mut events, |event| matches!(event, Event::Transmission { .. })).await else { unreachable!() };
+            assert_eq!(callsign, "N0TEST/TEST");
+            sources.push(source);
+        }
+        assert_eq!(sources, ["rf", "reflector"]);
+
+        // The history keeps both, for a page that connects later
+        let history = state::read(&shared).history;
+        assert_eq!(history.iter().map(|transmission| transmission.source).collect::<Vec<_>>(), ["rf", "reflector"]);
+    }
+
+    #[tokio::test]
+    async fn the_voice_of_real_traffic_is_sent_to_the_meter_but_announcements_are_not() {
+        let (mut router, radio) = Router::new();
+        let announcer = router.attach("announcement", Scope::LocalOnly);
+        let (meter, mut measured) = mpsc::channel(64);
+        router.set_meter(meter);
+        tokio::spawn(router.run(RadioTaps::default(), Shared::default()));
+
+        transmit(&announcer.to_router, "CQCQCQ").await;
+        transmit(&radio.to_router, "CQCQCQ").await;
+        let mut heard = Vec::new();
+        while heard.len() < 4 {
+            match tokio::time::timeout(Duration::from_secs(2), measured.recv()).await {
+                Ok(Some(input)) => heard.push(match input {
+                    meter::Input::Start => "start".to_string(),
+                    meter::Input::Frame { source, callsign, .. } => format!("{source} {callsign}"),
+                    meter::Input::End => "end".to_string(),
+                }),
+                _ => break,
+            }
+        }
+        assert_eq!(heard, ["start", "rf N0TEST/TEST", "end"]);
     }
 
     #[tokio::test]

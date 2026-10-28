@@ -7,6 +7,7 @@ use super::tokens::Tokens;
 use super::{network, Command, LinkMode};
 use crate::codec::{ulaw, Audio, SAMPLES_PER_FRAME};
 use crate::config::Allstar;
+use crate::live::Event as LiveEvent;
 use crate::speech::{self, Speaker};
 use crate::state::{self, PeerStatus, Shared};
 use anyhow::Context;
@@ -222,11 +223,15 @@ impl Node {
             .map(|link| PeerStatus { id: link.node.clone(), mode: if link.mode == LinkMode::Monitor { "monitor" } else { "transceive" }, outbound: link.outbound, connected: link.up, keyed: link.rx_keyed || link.tx_keyed, talking: link.rx_keyed })
             .collect();
         let spoken = spoken_links(self.allstar.node, &peers);
+        let mut finished = Vec::new();
         state::update(&self.shared, |snapshot| {
-            state::sync_link_peers(snapshot, super::LINK_KIND, &peers);
+            finished = state::sync_link_peers(snapshot, super::LINK_KIND, &peers);
             let status = state::link_mut(snapshot, super::LINK_NAME, super::LINK_KIND);
             (status.connected, status.peers, status.spoken) = (peers.iter().any(|peer| peer.connected), peers, spoken);
         });
+        for transmission in finished {
+            self.shared.emit(LiveEvent::Transmission { source: transmission.source, callsign: transmission.callsign, started_at: transmission.started_at, seconds: transmission.seconds });
+        }
     }
 
     // ---- Packets in ----
@@ -890,6 +895,10 @@ mod tests {
         // The node that spoke is now a peer of the one that heard it, and isn't talking any more
         let peers = state::read(&second.shared).peers;
         assert_eq!((peers.len(), peers[0].callsign.as_str(), peers[0].via, peers[0].transmissions, peers[0].talking, peers[0].linked), (1, "10001", "allstar", 1, false, Some(true)));
+
+        // And the traffic chart is told it was that node who spoke
+        let history = state::read(&second.shared).history;
+        assert_eq!(history.iter().map(|transmission| (transmission.source, transmission.callsign.as_str())).collect::<Vec<_>>(), [("allstar", "10001")]);
 
         // And back the other way, over the same link
         transmit(&second.to_node, 30).await;

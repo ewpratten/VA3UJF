@@ -11,6 +11,7 @@ mod hosts;
 mod integration;
 mod http;
 mod live;
+mod meter;
 mod modem;
 mod reflector;
 mod router;
@@ -55,6 +56,12 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
 
     // Whoever finishes a transmission over RF is answered with how well they were heard, if that's wanted
     let acks = config.ack.clone().map(|ack| ack::start(ack, config.station.clone(), &mut router));
+
+    // How loud each transmission is, which needs an AMBEserver to decode its voice on
+    let meter_ambeserver = config.allstar.as_ref().map(|allstar| allstar.ambeserver.clone()).or_else(|| config.speech.as_ref().and_then(|speech| speech.ambeserver.clone()));
+    if let Some(ambeserver) = meter_ambeserver {
+        router.set_meter(meter::start(ambeserver, shared.clone()));
+    }
 
     // The links
     let reflector_port = router.attach(reflector::LINK_KIND, router::Scope::Everyone);

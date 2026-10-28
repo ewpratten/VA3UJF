@@ -127,7 +127,11 @@ impl Vocoder {
     }
 }
 
-// An AMBEserver that answers its setup requests, and turns every frame of speech into one frame of AMBE
+// What the fake AMBEserver says every decoded sample is
+#[cfg(test)]
+pub const FAKE_SPEECH_LEVEL: i16 = 3000;
+
+// An AMBEserver that answers its setup requests, turns every frame of speech into one frame of AMBE, and every frame of AMBE into steady speech
 #[cfg(test)]
 pub async fn fake_server() -> SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -143,6 +147,9 @@ pub async fn fake_server() -> SocketAddr {
                     counter = counter.wrapping_add(1);
                     [&CHANNEL_HEADER[..], &[counter; 9]].concat()
                 }
+
+                // Every frame of AMBE it's asked to decode comes back as a steady level of speech
+                (TYPE_CHANNEL, _, _) => [&SPEECH_HEADER[..], &FAKE_SPEECH_LEVEL.to_be_bytes().repeat(SAMPLES_PER_FRAME)].concat(),
                 _ => continue,
             };
             let _ = socket.send_to(&reply, peer).await;
