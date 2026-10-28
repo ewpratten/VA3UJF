@@ -1,8 +1,9 @@
 // Live status of every part of the hotspot, shared with the web UI
 
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 
 const HEARD_HISTORY: usize = 15;
 
@@ -59,19 +60,33 @@ pub struct Snapshot {
     pub vocoder_connected: Option<bool>,
 }
 
-pub type Shared = Arc<Mutex<Snapshot>>;
+// The snapshot has one writer at a time, and anything that needs to react to a change can subscribe to it
+#[derive(Clone)]
+pub struct Shared(Arc<watch::Sender<Snapshot>>);
+
+
+impl Default for Shared {
+    fn default() -> Self {
+        Shared(Arc::new(watch::channel(Snapshot::default()).0))
+    }
+}
+
+impl Shared {
+    pub fn subscribe(&self) -> watch::Receiver<Snapshot> {
+        self.0.subscribe()
+    }
+}
 
 pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs())
 }
 
-// Update the snapshot without every caller handling a poisoned lock
 pub fn update(shared: &Shared, change: impl FnOnce(&mut Snapshot)) {
-    change(&mut shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    shared.0.send_modify(change);
 }
 
 pub fn read(shared: &Shared) -> Snapshot {
-    shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    shared.0.borrow().clone()
 }
 
 pub fn finish_transmission(snapshot: &mut Snapshot) {

@@ -60,7 +60,7 @@ fn parse_sentence(sentence: &[u8]) -> Option<String> {
     }
     let expected = u16::from_str_radix(std::str::from_utf8(&sentence[5..9]).ok()?, 16).ok()?;
     let payload = &sentence[10..];
-    if u16::from_le_bytes(crc_ccitt(payload)) != expected {
+    if crc_ccitt(payload) != expected {
         log::debug!("D-PRS sentence failed its CRC: {}", String::from_utf8_lossy(sentence).trim_end());
         return None;
     }
@@ -88,7 +88,7 @@ mod tests {
 
     // Lay a sentence out the way a radio sends it: sync, then scrambled GPS blocks of five bytes over two frames each
     fn slow_data_frames(payload: &str) -> Vec<[u8; 3]> {
-        let crc = u16::from_le_bytes(crc_ccitt(payload.as_bytes()));
+        let crc = crc_ccitt(payload.as_bytes());
         let mut sentence = format!("$$CRC{crc:04X},{payload}").into_bytes();
         while sentence.len() % 5 != 0 {
             sentence.push(b'f');
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn crc_matches_the_icom_check_value() {
-        assert_eq!(crc_ccitt(b"ABCDEF"), 0x6F5Eu16.to_le_bytes());
+        assert_eq!(crc_ccitt(b"ABCDEF"), 0x6F5E);
     }
 
     #[test]

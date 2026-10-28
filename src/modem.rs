@@ -2,14 +2,18 @@
 
 use crate::config::{Modem, Station};
 use crate::state::{self, Shared};
-use crate::dstar::{Frame, Header, HEADER_LENGTH};
+use crate::dstar::{Frame, HeaderWithCrc};
 use anyhow::{bail, Context};
+use futures_util::{SinkExt, StreamExt};
 use std::collections::VecDeque;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, timeout, Instant};
 use tokio_serial::SerialPortBuilderExt;
+use tokio_util::bytes::{Buf, BufMut, BytesMut};
+use tokio_util::codec::{Decoder, Encoder, Framed};
+use zerocopy::byteorder::{LittleEndian, U32};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 const FRAME_START: u8 = 0xE0;
 const GET_VERSION: u8 = 0x00;
@@ -32,68 +36,76 @@ struct ModemFrame {
     payload: Vec<u8>,
 }
 
+// Frames are a start byte, a length that counts the whole frame, a type, and the payload. Lengths past 255 spill into a third byte
+struct MmdvmCodec;
+
+impl Decoder for MmdvmCodec {
+    type Item = ModemFrame;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, source: &mut BytesMut) -> Result<Option<ModemFrame>, Self::Error> {
+        loop {
+            // Resynchronise on the next start byte after any noise
+            let Some(start) = source.iter().position(|byte| *byte == FRAME_START) else {
+                source.clear();
+                return Ok(None);
+            };
+            source.advance(start);
+            if source.len() < 3 {
+                return Ok(None);
+            }
+            let (length, header_length) = if source[1] == 0 {
+                if source.len() < 4 {
+                    return Ok(None);
+                }
+                (source[2] as usize + 255, 4)
+            } else {
+                (source[1] as usize, 3)
+            };
+            if length < header_length {
+                source.advance(1);
+                continue;
+            }
+            if source.len() < length {
+                return Ok(None);
+            }
+            let frame = source.split_to(length);
+            return Ok(Some(ModemFrame { kind: frame[header_length - 1], payload: frame[header_length..].to_vec() }));
+        }
+    }
+}
+
+impl Encoder<ModemFrame> for MmdvmCodec {
+    type Error = std::io::Error;
+
+    fn encode(&mut self, frame: ModemFrame, destination: &mut BytesMut) -> Result<(), Self::Error> {
+        let mut length = frame.payload.len() + 3;
+        destination.put_u8(FRAME_START);
+        if length > 255 {
+            // The long form's extra length byte counts toward the frame
+            length += 1;
+            destination.put_slice(&[0, (length - 255) as u8]);
+        } else {
+            destination.put_u8(length as u8);
+        }
+        destination.put_u8(frame.kind);
+        destination.put_slice(&frame.payload);
+        Ok(())
+    }
+}
+
 struct Link {
-    port: tokio_serial::SerialStream,
-    buffer: Vec<u8>,
+    port: Framed<tokio_serial::SerialStream, MmdvmCodec>,
     protocol_version: u8,
 }
 
 impl Link {
     async fn send(&mut self, kind: u8, payload: &[u8]) -> anyhow::Result<()> {
-        let length = payload.len() + 3;
-        let mut packet = vec![FRAME_START];
-        if length > 255 {
-            packet.extend([0, (length - 255) as u8]);
-        } else {
-            packet.push(length as u8);
-        }
-        packet.push(kind);
-        packet.extend(payload);
-        self.port.write_all(&packet).await?;
-        Ok(())
-    }
-
-    // Split one complete frame off the front of the receive buffer
-    fn take_frame(&mut self) -> Option<ModemFrame> {
-        loop {
-            let start = self.buffer.iter().position(|byte| *byte == FRAME_START)?;
-            self.buffer.drain(..start);
-            if self.buffer.len() < 3 {
-                return None;
-            }
-            let (length, header_length) = if self.buffer[1] == 0 {
-                if self.buffer.len() < 4 {
-                    return None;
-                }
-                (self.buffer[2] as usize + 255, 4)
-            } else {
-                (self.buffer[1] as usize, 3)
-            };
-            if length < header_length {
-                self.buffer.drain(..1);
-                continue;
-            }
-            if self.buffer.len() < length {
-                return None;
-            }
-            let frame = ModemFrame { kind: self.buffer[header_length - 1], payload: self.buffer[header_length..length].to_vec() };
-            self.buffer.drain(..length);
-            return Some(frame);
-        }
+        Ok(self.port.send(ModemFrame { kind, payload: payload.to_vec() }).await?)
     }
 
     async fn receive(&mut self) -> anyhow::Result<ModemFrame> {
-        loop {
-            if let Some(frame) = self.take_frame() {
-                return Ok(frame);
-            }
-            let mut chunk = [0u8; 512];
-            let count = self.port.read(&mut chunk).await?;
-            if count == 0 {
-                bail!("modem port closed");
-            }
-            self.buffer.extend(&chunk[..count]);
-        }
+        Ok(self.port.next().await.context("modem port closed")??)
     }
 
     // Wait for the modem's answer to a command, skipping anything unrelated
@@ -142,18 +154,23 @@ fn set_config_payload(protocol_version: u8, modem: &Modem) -> Vec<u8> {
 }
 
 // The modem checks the POCSAG transmit frequency against its bands even though D-STAR never uses it, so it can't be left blank
-fn set_frequency_payload(frequency_hz: u32, rf_level: f32) -> Vec<u8> {
-    let mut payload = vec![0u8; 14];
-    payload[1..5].copy_from_slice(&frequency_hz.to_le_bytes());
-    payload[5..9].copy_from_slice(&frequency_hz.to_le_bytes());
-    payload[9] = level_byte(rf_level);
-    payload[10..14].copy_from_slice(&frequency_hz.to_le_bytes());
-    payload
+#[derive(Debug, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(C)]
+struct SetFrequency {
+    reserved: u8,
+    rx_hz: U32<LittleEndian>,
+    tx_hz: U32<LittleEndian>,
+    rf_level: u8,
+    pocsag_hz: U32<LittleEndian>,
+}
+
+fn set_frequency_payload(frequency_hz: u32, rf_level: f32) -> SetFrequency {
+    SetFrequency { reserved: 0, rx_hz: frequency_hz.into(), tx_hz: frequency_hz.into(), rf_level: level_byte(rf_level), pocsag_hz: frequency_hz.into() }
 }
 
 async fn connect(modem: &Modem, station: &Station, shared: &Shared) -> anyhow::Result<Link> {
     let port = tokio_serial::new(&modem.port, modem.baud).open_native_async().with_context(|| format!("couldn't open {}", modem.port))?;
-    let mut link = Link { port, buffer: Vec::new(), protocol_version: 0 };
+    let mut link = Link { port: Framed::new(port, MmdvmCodec), protocol_version: 0 };
 
     // Find out what the modem speaks, retrying while it boots
     sleep(Duration::from_secs(2)).await;
@@ -177,7 +194,7 @@ async fn connect(modem: &Modem, station: &Station, shared: &Shared) -> anyhow::R
 
     // Tune and configure for D-STAR only, simplex
     let frequency_hz = (station.frequency_mhz * 1_000_000.0) as u32;
-    link.send(SET_FREQ, &set_frequency_payload(frequency_hz, modem.rf_level)).await?;
+    link.send(SET_FREQ, set_frequency_payload(frequency_hz, modem.rf_level).as_bytes()).await?;
     link.expect(ACK).await.context("SET_FREQ")?;
     link.send(SET_CONFIG, &set_config_payload(link.protocol_version, modem)).await?;
     link.expect(ACK).await.context("SET_CONFIG")?;
@@ -213,9 +230,9 @@ async fn session(link: &mut Link, from_modem: &mpsc::Sender<Frame>, to_modem: &m
                             free_slots = space;
                         }
                     }
-                    DSTAR_HEADER if frame.payload.len() >= HEADER_LENGTH => {
-                        if let Some(header) = Header::from_body(&frame.payload[..39]) {
-                            from_modem.send(Frame::Header(header)).await?;
+                    DSTAR_HEADER => {
+                        if let Ok((framed, _)) = HeaderWithCrc::read_from_prefix(&frame.payload) {
+                            from_modem.send(Frame::Header(framed.header)).await?;
                         }
                     }
                     DSTAR_DATA if frame.payload.len() >= 12 => {
@@ -233,7 +250,7 @@ async fn session(link: &mut Link, from_modem: &mpsc::Sender<Frame>, to_modem: &m
         // Feed the modem's transmit buffer as space allows
         while let Some(next) = pending.front() {
             let (needed, kind, payload) = match next {
-                Frame::Header(header) => (5, DSTAR_HEADER, header.to_bytes()),
+                Frame::Header(header) => (5, DSTAR_HEADER, header.with_crc().as_bytes().to_vec()),
                 Frame::Voice { ambe, slow_data, .. } => (2, DSTAR_DATA, [&ambe[..], &slow_data[..]].concat()),
                 Frame::End => (2, DSTAR_EOT, Vec::new()),
             };
@@ -273,11 +290,23 @@ mod tests {
     fn set_frequency_fills_every_field_the_modem_checks() {
         // MMDVMHost's layout: a spare byte, receive and transmit frequencies, power, then the POCSAG frequency
         let payload = set_frequency_payload(446_500_000, 50.0);
-        assert_eq!(payload.len(), 14);
-        assert_eq!(payload[0], 0);
-        assert_eq!(payload[1..5], 446_500_000u32.to_le_bytes());
-        assert_eq!(payload[5..9], 446_500_000u32.to_le_bytes());
-        assert_eq!(payload[9], 128);
-        assert_eq!(payload[10..14], 446_500_000u32.to_le_bytes());
+        assert_eq!(payload.as_bytes().len(), 14);
+        assert_eq!(payload.reserved, 0);
+        assert_eq!(payload.rx_hz.get(), 446_500_000);
+        assert_eq!(payload.tx_hz.get(), 446_500_000);
+        assert_eq!(payload.rf_level, 128);
+        assert_eq!(payload.pocsag_hz.get(), 446_500_000);
+    }
+
+    #[test]
+    fn codec_resynchronises_and_handles_long_frames() {
+        let mut codec = MmdvmCodec;
+        let mut encoded = BytesMut::new();
+        codec.encode(ModemFrame { kind: DSTAR_DATA, payload: vec![7; 300] }, &mut encoded).unwrap();
+        let mut source = BytesMut::from(&[0x00, 0x55][..]);
+        source.extend_from_slice(&encoded);
+        let frame = codec.decode(&mut source).unwrap().unwrap();
+        assert_eq!((frame.kind, frame.payload.len()), (DSTAR_DATA, 300));
+        assert!(codec.decode(&mut source).unwrap().is_none());
     }
 }
