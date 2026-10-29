@@ -8,6 +8,7 @@ use crate::live::Event;
 use crate::meter;
 use crate::slowdata::{Decoded, Decoder};
 use crate::speech::{Announcement, Speaker};
+use crate::voice_control;
 use crate::state::{self, Shared, Transmission};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -316,14 +317,16 @@ pub struct RadioTaps {
     pub position_reports: Option<mpsc::Sender<String>>,
     pub speaker: Option<Speaker>,
     pub acks: Option<mpsc::Sender<AckRequest>>,
+    pub commands: Option<voice_control::Tap>,
 
-    // Whether the stream being heard is a request to the repeater, which goes no further than it
+    // Whether the stream being heard is a request to the repeater, or a command spoken to it, which goes no further than it
     request_stream: bool,
+    command_stream: bool,
 }
 
 impl RadioTaps {
-    pub fn new(position_reports: Option<mpsc::Sender<String>>, speaker: Option<Speaker>, acks: Option<mpsc::Sender<AckRequest>>) -> Self {
-        RadioTaps { position_reports, speaker, acks, request_stream: false }
+    pub fn new(position_reports: Option<mpsc::Sender<String>>, speaker: Option<Speaker>, acks: Option<mpsc::Sender<AckRequest>>, commands: Option<voice_control::Tap>) -> Self {
+        RadioTaps { position_reports, speaker, acks, commands, request_stream: false, command_stream: false }
     }
 
     // A position report heard over RF, on its way to APRS-IS
@@ -335,7 +338,8 @@ impl RadioTaps {
         }
     }
 
-    // An info request is answered out loud, once whoever sent it has finished transmitting. Returns whether the frame was for the repeater alone
+    // An info request is answered out loud, once whoever sent it has finished transmitting, and a command spoken to the repeater is handed
+    // to voice control. Returns whether the frame was for the repeater alone
     fn observe(&mut self, frame: &Frame) -> bool {
         if let Frame::Header(header) = frame {
             self.request_stream = is_info_request(header);
@@ -345,8 +349,16 @@ impl RadioTaps {
                     let _ = speaker.try_send(Announcement::Status);
                 }
             }
+            self.command_stream = self.commands.as_ref().is_some_and(|tap| header.your_call == tap.your_call);
         }
-        self.request_stream
+        if let (true, Some(tap)) = (self.command_stream, &self.commands) {
+            let _ = match frame {
+                Frame::Header(header) => tap.inputs.try_send(voice_control::Input::Start { caller: header.my_call_text() }),
+                Frame::Voice { ambe, .. } => tap.inputs.try_send(voice_control::Input::Frame(*ambe)),
+                Frame::End => tap.inputs.try_send(voice_control::Input::End),
+            };
+        }
+        self.request_stream || self.command_stream
     }
 }
 
@@ -384,7 +396,7 @@ mod tests {
         let (mut router, radio) = Router::new();
         let mut link = router.attach("test", Scope::Everyone);
         let (speaker, mut announcements) = mpsc::channel(4);
-        tokio::spawn(router.run(RadioTaps::new(None, Some(speaker), None), Shared::default()));
+        tokio::spawn(router.run(RadioTaps::new(None, Some(speaker), None, None), Shared::default()));
 
         // The request is spoken back, and none of it reaches the link
         transmit(&radio.to_router, "       I").await;
@@ -395,6 +407,27 @@ mod tests {
         transmit(&radio.to_router, "CQCQCQ").await;
         assert!(heard_header(&mut link).await);
         assert!(announcements.try_recv().is_err(), "an ordinary transmission was taken for an info request");
+    }
+
+    #[tokio::test]
+    async fn a_call_to_the_node_goes_to_voice_control_and_no_further() {
+        let (mut router, radio) = Router::new();
+        let mut link = router.attach("test", Scope::Everyone);
+        let (inputs, mut commands) = mpsc::channel(16);
+        let tap = voice_control::Tap { your_call: pad("N0CALL"), inputs };
+        tokio::spawn(router.run(RadioTaps::new(None, None, None, Some(tap)), Shared::default()));
+
+        // Voice control is given the whole transmission, and none of it reaches the link
+        transmit(&radio.to_router, "N0CALL").await;
+        assert!(matches!(commands.recv().await, Some(voice_control::Input::Start { caller }) if caller == "N0TEST/TEST"));
+        assert!(matches!(commands.recv().await, Some(voice_control::Input::Frame(_))));
+        assert!(matches!(commands.recv().await, Some(voice_control::Input::End)));
+        assert!(heard_nothing(&mut link).await, "the command leaked to a link");
+
+        // An ordinary transmission right after it still reaches the link, and isn't taken as a command
+        transmit(&radio.to_router, "CQCQCQ").await;
+        assert!(heard_header(&mut link).await);
+        assert!(commands.try_recv().is_err(), "an ordinary transmission was taken for a command");
     }
 
     #[tokio::test]
@@ -504,7 +537,7 @@ mod tests {
         let shared = Shared::default();
         let mut events = shared.subscribe_events();
         let (reports, mut gated) = mpsc::channel(4);
-        tokio::spawn(router.run(RadioTaps::new(Some(reports), None, None), shared.clone()));
+        tokio::spawn(router.run(RadioTaps::new(Some(reports), None, None, None), shared.clone()));
 
         let report = "N0TEST>API282,DSTAR*:!4530.00N/07545.60W>Hi\r";
         let mut frames: Vec<Frame> = crate::dprs::testing::slow_data_frames(report).into_iter().map(|slow_data| Frame::Voice { sequence: 0, ambe: [1; 9], slow_data }).collect();
@@ -528,7 +561,7 @@ mod tests {
         let shared = Shared::default();
         let mut events = shared.subscribe_events();
         let (acks, mut requests) = mpsc::channel(4);
-        tokio::spawn(router.run(RadioTaps::new(None, None, Some(acks)), shared.clone()));
+        tokio::spawn(router.run(RadioTaps::new(None, None, Some(acks), None), shared.clone()));
 
         // Ten clean frames of voice, and one that lost a bit on the way
         let clean = fec::testing::frame_for(0x5A3, 0x2C7);
@@ -549,7 +582,7 @@ mod tests {
         let (router, radio) = Router::new();
         let (acks, mut requests) = mpsc::channel(4);
         let (speaker, _announcements) = mpsc::channel(4);
-        tokio::spawn(router.run(RadioTaps::new(None, Some(speaker), Some(acks)), Shared::default()));
+        tokio::spawn(router.run(RadioTaps::new(None, Some(speaker), Some(acks), None), Shared::default()));
 
         transmit(&radio.to_router, "       I").await;
         assert!(tokio::time::timeout(Duration::from_millis(300), requests.recv()).await.is_err(), "an info request was acknowledged");

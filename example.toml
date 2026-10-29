@@ -76,3 +76,14 @@ actions = [{ unlink = "54321" }]
 # Stations can be reached at a fixed audio address instead of through the directory, which also sets where each is expected to call in from
 # [echolink.stations]
 # "W1AW-R" = "192.0.2.30:5198"
+
+# Operators manage the node by calling the station's own callsign over RF, in plain language, like "link to AllStar node 5 4 3 2 1". What they say is
+# transcribed here, and a language model reached through a Cloudflare AI Gateway carries it out with tools that link, unlink and report on the links.
+# The reply is spoken, so [speech] is needed. Only the listed callsigns are obeyed, and D-STAR doesn't authenticate callsigns, so treat this as a convenience
+# rather than a lock. The gateway's token is read from the file, and the Docker image carries the speech recognition model in the default directory
+# [voice_control]
+# operators = ["N0CALL"]
+# account_id = "0123456789abcdef0123456789abcdef"
+# token_file = "/etc/va3ujf/gateway_token"
+# gateway_id = "va3ujf"
+# model = "@cf/zai-org/glm-5.3-flash"
