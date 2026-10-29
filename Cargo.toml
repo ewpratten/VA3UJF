@@ -32,6 +32,7 @@ crc = "3.4.0"
 zerocopy = { version = "0.8.63", features = ["derive"] }
 audio-codec-algorithms = "0.8.1"
 oxideav-gsm = "0.0.10"
+rig-core = { version = "0.37", default-features = false, features = ["rustls", "derive"] }
 tokio-util = { version = "0.7.20", features = ["codec"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 hmac = "0.13.0"

@@ -54,12 +54,22 @@ pub fn spelled(identifier: &str) -> String {
 }
 
 // A lone letter is read as a word, so modules are named from the phonetic alphabet
+const PHONETIC_ALPHABET: [&str; 26] = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliet", "Kilo", "Lima", "Mike", "November", "Oscar", "Papa", "Quebec", "Romeo", "Sierra", "Tango", "Uniform", "Victor", "Whiskey", "X-ray", "Yankee", "Zulu"];
+
 fn module_name(module: &str) -> String {
-    const ALPHABET: [&str; 26] = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliet", "Kilo", "Lima", "Mike", "November", "Oscar", "Papa", "Quebec", "Romeo", "Sierra", "Tango", "Uniform", "Victor", "Whiskey", "X-ray", "Yankee", "Zulu"];
     match module.chars().next().filter(char::is_ascii_alphabetic) {
-        Some(letter) => ALPHABET[(letter.to_ascii_uppercase() as u8 - b'A') as usize].to_string(),
+        Some(letter) => PHONETIC_ALPHABET[(letter.to_ascii_uppercase() as u8 - b'A') as usize].to_string(),
         None => module.to_string(),
     }
+}
+
+// The letter a module was named by, which operators say as a lone letter or from the phonetic alphabet
+pub fn module_letter(text: &str) -> Option<char> {
+    let text = text.trim();
+    if let Some(letter) = text.chars().next().filter(|letter| text.len() == 1 && letter.is_ascii_alphabetic()) {
+        return Some(letter.to_ascii_uppercase());
+    }
+    PHONETIC_ALPHABET.iter().position(|name| name.eq_ignore_ascii_case(text)).map(|index| (b'A' + index as u8) as char)
 }
 
 // "DCS405 A" as it's said: the reflector and then its module
@@ -256,6 +266,7 @@ mod tests {
         assert_eq!(spelled("54207"), "5 4 2 0 7");
         assert_eq!(spoken_reflector("DCS405 A"), "D C S 4 0 5, module Alpha");
         assert_eq!(spoken_reflector("XRF757 C"), "X R F 7 5 7, module Charlie");
+        assert_eq!((module_letter("b"), module_letter("Charlie"), module_letter("x-ray"), module_letter("AB"), module_letter("")), (Some('B'), Some('C'), Some('X'), None, None));
     }
 
     #[test]

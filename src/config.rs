@@ -14,6 +14,7 @@ pub struct Config {
     pub echolink: Option<Echolink>,
     pub hosts: Option<Hosts>,
     pub speech: Option<Speech>,
+    pub voice_control: Option<VoiceControl>,
     pub ack: Option<Ack>,
     #[serde(default, rename = "reflector")]
     pub reflectors: Vec<Reflector>,
@@ -138,6 +139,31 @@ pub struct Speech {
     pub threads: i32,
 }
 
+// Lets operators manage the node in plain language by calling the station's own callsign over RF. What they say is transcribed here and handed
+// to a language model reached through a Cloudflare AI Gateway, which can link and unlink stations. The reply is spoken back
+#[derive(Deserialize, Clone)]
+pub struct VoiceControl {
+    // Only these callsigns have their commands carried out. Calls from anyone else are answered with a refusal
+    pub operators: Vec<String>,
+    pub account_id: String,
+    #[serde(default = "default_gateway_id")]
+    pub gateway_id: String,
+
+    // The gateway's token is read from a file, to keep it out of the configuration
+    pub token_file: PathBuf,
+    #[serde(default = "default_voice_control_model")]
+    pub model: String,
+
+    // Defaults to the AMBEserver that announcements use
+    pub ambeserver: Option<String>,
+
+    // Holds a sherpa-onnx Moonshine v2 model: encoder_model.ort, decoder_model_merged.ort, and tokens.txt
+    #[serde(default = "default_stt_directory")]
+    pub stt_directory: PathBuf,
+    #[serde(default = "default_speech_threads")]
+    pub threads: i32,
+}
+
 // Answers an RF user who has finished transmitting with a short transmission of its own: an ACK, and how well they were heard
 #[derive(Deserialize, Clone)]
 pub struct Ack {
@@ -211,6 +237,9 @@ pub struct Hosts {
 }
 
 fn default_voice_directory() -> PathBuf { PathBuf::from("/usr/share/va3ujf/voice") }
+fn default_gateway_id() -> String { "va3ujf".to_string() }
+fn default_voice_control_model() -> String { "@cf/zai-org/glm-5.3-flash".to_string() }
+fn default_stt_directory() -> PathBuf { PathBuf::from("/usr/share/va3ujf/stt") }
 fn default_speech_speed() -> f32 { 1.0 }
 fn default_speech_threads() -> i32 { 4 }
 fn default_iax_port() -> u16 { 4569 }
@@ -244,6 +273,14 @@ impl Config {
         if config.speech.as_ref().is_some_and(|speech| speech.ambeserver.is_none()) && config.allstar.is_none() {
             anyhow::bail!("speech needs an AMBEserver to vocode through: set ambeserver in [speech], or add an [allstar] section to borrow its");
         }
+        if let Some(voice_control) = &config.voice_control {
+            if voice_control.operators.is_empty() {
+                anyhow::bail!("voice_control needs at least one callsign in operators, or nobody could use it");
+            }
+            if config.speech.is_none() {
+                anyhow::bail!("voice_control speaks its replies, so it needs a [speech] section");
+            }
+        }
         Ok(config)
     }
 
@@ -267,6 +304,20 @@ mod tests {
         let loaded = super::Config::load(&path);
         std::fs::remove_file(&path).ok();
         assert!(loaded.is_ok());
+    }
+
+    #[test]
+    fn voice_control_needs_operators_and_speech() {
+        let load = |extra: &str| {
+            let path = std::env::temp_dir().join(format!("va3ujf-voice-control-{}-{}.toml", std::process::id(), extra.len()));
+            std::fs::write(&path, format!("[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0\n[modem]\nport = \"/dev/null\"\n[speech]\nambeserver = \"127.0.0.1:2460\"\n{extra}")).unwrap();
+            let loaded = super::Config::load(&path);
+            std::fs::remove_file(&path).ok();
+            loaded
+        };
+        let voice_control = "[voice_control]\naccount_id = \"abc\"\ntoken_file = \"/dev/null\"\n";
+        assert!(format!("{:#}", load(&format!("{voice_control}operators = []\n")).err().expect("no operators to be refused")).contains("operators"));
+        assert!(load(&format!("{voice_control}operators = [\"N0CALL\"]\n")).is_ok());
     }
 
     #[test]

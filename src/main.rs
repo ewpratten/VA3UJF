@@ -20,6 +20,7 @@ mod router;
 mod slowdata;
 mod speech;
 mod state;
+mod voice_control;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -71,6 +72,13 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
     tokio::spawn(reflector::run(config.clone(), directory.clone(), command_receiver, reflector_port, shared.clone(), speaker.clone()));
     let allstar_handle = config.allstar.clone().map(|allstar| allstar::start(allstar, config.station.clone(), shared.clone(), &mut router, speaker.clone()));
     let echolink_handle = config.echolink.clone().map(|echolink| echolink::start(echolink, config.station.clone(), shared.clone(), &mut router, speaker.clone()));
+
+    // Operators who call the station's own callsign over RF can manage the links in plain language
+    let command_tap = config.voice_control.clone().and_then(|voice_control| {
+        let ambeserver = voice_control.ambeserver.clone().or_else(|| config.speech.as_ref().and_then(|speech| speech.ambeserver.clone())).or_else(|| config.allstar.as_ref().map(|allstar| allstar.ambeserver.clone())).or_else(|| config.echolink.as_ref().map(|echolink| echolink.ambeserver.clone()))?;
+        let controls = voice_control::Controls { allstar: allstar_handle.clone(), echolink: echolink_handle.clone(), reflector_commands: command_sender.clone(), reflectors: directory.clone(), station: config.station.clone(), shared: shared.clone() };
+        Some(voice_control::start(voice_control, ambeserver, &config.station.callsign, controls, speaker.clone()?))
+    });
     if config.allstar.as_ref().is_some_and(|allstar| allstar.park_reflector) {
         tokio::spawn(reflector::park::run(shared.clone(), command_sender.clone()));
     }
@@ -92,7 +100,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
 
     // Pass voice between the radio and the links until told to stop
     tokio::select! {
-        _ = router.run(router::RadioTaps::new(position_reports, speaker, acks), shared) => Ok(()),
+        _ = router.run(router::RadioTaps::new(position_reports, speaker, acks, command_tap), shared) => Ok(()),
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
