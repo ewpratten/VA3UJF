@@ -6,6 +6,7 @@ mod codec;
 mod config;
 mod dprs;
 mod dstar;
+mod echolink;
 mod hosts;
 #[cfg(test)]
 mod integration;
@@ -69,6 +70,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
     let reflector_port = router.attach(reflector::LINK_KIND, router::Scope::Everyone);
     tokio::spawn(reflector::run(config.clone(), directory.clone(), command_receiver, reflector_port, shared.clone(), speaker.clone()));
     let allstar_handle = config.allstar.clone().map(|allstar| allstar::start(allstar, config.station.clone(), shared.clone(), &mut router, speaker.clone()));
+    let echolink_handle = config.echolink.clone().map(|echolink| echolink::start(echolink, config.station.clone(), shared.clone(), &mut router, speaker.clone()));
     if config.allstar.as_ref().is_some_and(|allstar| allstar.park_reflector) {
         tokio::spawn(reflector::park::run(shared.clone(), command_sender.clone()));
     }
@@ -83,7 +85,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
     let http_config = config.clone();
     let http_shared = shared.clone();
     tokio::spawn(async move {
-        if let Err(error) = http::serve(http_config, directory, http_shared, command_sender, allstar_handle, metrics).await {
+        if let Err(error) = http::serve(http_config, directory, http_shared, command_sender, allstar_handle, echolink_handle, metrics).await {
             log::error!("Web UI failed: {error:#}");
         }
     });

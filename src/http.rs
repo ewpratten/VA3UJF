@@ -1,6 +1,7 @@
 // Web UI for watching the hotspot live and controlling its links
 
 use crate::allstar;
+use crate::echolink;
 use crate::config::{Action, Config};
 use crate::hosts::{self, Directory};
 use crate::metrics::Metrics;
@@ -30,6 +31,7 @@ struct App {
     shared: Shared,
     commands: mpsc::Sender<Command>,
     allstar: Option<allstar::Handle>,
+    echolink: Option<echolink::Handle>,
     metrics: Arc<Metrics>,
 }
 
@@ -44,6 +46,11 @@ struct AllstarLinkForm {
 #[derive(Deserialize)]
 struct AllstarUnlinkForm {
     node: String,
+}
+
+#[derive(Deserialize)]
+struct EcholinkForm {
+    station: String,
 }
 
 #[derive(Deserialize)]
@@ -165,13 +172,29 @@ async fn allstar_unlink(State(app): State<App>, Form(form): Form<AllstarUnlinkFo
     allstar_action(&app, Action { unlink: Some(form.node.trim().to_string()), ..Action::default() }).await
 }
 
-fn routes(app: App) -> Router {
-    Router::new().route("/", get(index)).route("/api/status", get(status)).route("/live", get(live)).route("/metrics", get(metrics)).route("/link", post(link)).route("/unlink", post(unlink)).route("/allstar/link", post(allstar_link)).route("/allstar/unlink", post(allstar_unlink)).with_state(app)
+async fn echolink_link(State(app): State<App>, Form(form): Form<EcholinkForm>) -> Response {
+    let Some(handle) = &app.echolink else { return (StatusCode::NOT_FOUND, "EchoLink isn't configured").into_response() };
+    match handle.link(form.station.trim()).await {
+        Ok(()) => Redirect::to("/").into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
 }
 
-pub async fn serve(config: Config, directory: Directory, shared: Shared, commands: mpsc::Sender<Command>, allstar: Option<allstar::Handle>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
+async fn echolink_unlink(State(app): State<App>, Form(form): Form<EcholinkForm>) -> Response {
+    let Some(handle) = &app.echolink else { return (StatusCode::NOT_FOUND, "EchoLink isn't configured").into_response() };
+    match handle.unlink(form.station.trim()).await {
+        Ok(()) => Redirect::to("/").into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+}
+
+fn routes(app: App) -> Router {
+    Router::new().route("/", get(index)).route("/api/status", get(status)).route("/live", get(live)).route("/metrics", get(metrics)).route("/link", post(link)).route("/unlink", post(unlink)).route("/allstar/link", post(allstar_link)).route("/allstar/unlink", post(allstar_unlink)).route("/echolink/link", post(echolink_link)).route("/echolink/unlink", post(echolink_unlink)).with_state(app)
+}
+
+pub async fn serve(config: Config, directory: Directory, shared: Shared, commands: mpsc::Sender<Command>, allstar: Option<allstar::Handle>, echolink: Option<echolink::Handle>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
     let address = config.http_listen.clone().unwrap_or_else(|| "0.0.0.0:8080".to_string());
-    let app = routes(App { config, directory, shared, commands, allstar, metrics });
+    let app = routes(App { config, directory, shared, commands, allstar, echolink, metrics });
     let listener = tokio::net::TcpListener::bind(&address).await?;
     log::info!("Web UI on http://{address}");
     axum::serve(listener, app).await?;
@@ -202,7 +225,7 @@ mod tests {
         let (commands, _unused) = mpsc::channel(1);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = App { config, directory, shared: shared.clone(), commands, allstar: None, metrics: Arc::new(Metrics::new()) };
+        let app = App { config, directory, shared: shared.clone(), commands, allstar: None, echolink: None, metrics: Arc::new(Metrics::new()) };
         tokio::spawn(async move { axum::serve(listener, routes(app)).await });
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/live")).await.unwrap();
 
@@ -234,7 +257,7 @@ mod tests {
     async fn the_page_knows_where_the_repeater_is() {
         let config: Config = toml::from_str("[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.25\nlongitude = -90.5\n[modem]\nport = \"/dev/null\"\n").unwrap();
         let directory = hosts::directory(&config);
-        let app = App { config, directory, shared: Shared::default(), commands: mpsc::channel(1).0, allstar: None, metrics: Arc::new(Metrics::new()) };
+        let app = App { config, directory, shared: Shared::default(), commands: mpsc::channel(1).0, allstar: None, echolink: None, metrics: Arc::new(Metrics::new()) };
         let Html(page) = index(State(app)).await;
         assert!(page.contains("latitude: 45.25, longitude: -90.5"), "the repeater's position wasn't filled in");
         assert!(!page.contains("{{"), "a placeholder was left in the page");
@@ -249,7 +272,7 @@ mod tests {
         state::update(&shared, |snapshot| snapshot.modem_connected = true);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = App { config, directory, shared, commands: mpsc::channel(1).0, allstar: None, metrics: Arc::new(Metrics::new()) };
+        let app = App { config, directory, shared, commands: mpsc::channel(1).0, allstar: None, echolink: None, metrics: Arc::new(Metrics::new()) };
         tokio::spawn(async move { axum::serve(listener, routes(app)).await });
 
         let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();

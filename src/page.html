@@ -106,10 +106,19 @@
     <table><tbody id="allstar-schedule"></tbody></table>
   </div>
 
+  <div class="card" id="echolink-card" hidden>
+    <h2>EchoLink node <span id="echolink-callsign"></span></h2>
+    <table><tbody id="echolink-links"></tbody></table>
+    <form method="post" action="/echolink/link">
+      <input name="station" placeholder="Callsign or ID" style="width:9em" required aria-label="Station">
+      <button>Link</button>
+    </form>
+  </div>
+
 </main>
 <script>
   const STATION = { latitude: {{latitude}}, longitude: {{longitude}}, callsign: "{{callsign}}" };
-  const SOURCES = { rf: "RF", reflector: "Reflector", allstar: "AllStar node", announcement: "Announcement", ack: "Repeater" };
+  const SOURCES = { rf: "RF", reflector: "Reflector", allstar: "AllStar node", echolink: "EchoLink station", announcement: "Announcement", ack: "Repeater" };
   
   const sourceName = (source) => SOURCES[source] ?? source;
   const text = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
@@ -138,7 +147,9 @@
   const LEVEL_STALE_MS = 800;
   const levels = new Map();
 
-  const levelKey = (peer) => peer.via === "allstar" ? "source:allstar" : `call:${peer.callsign}`;
+  // Peers reached through a link that reports on them, rather than stations heard directly
+  const LINKED_VIA = { allstar: "AllStar", echolink: "EchoLink" };
+  const levelKey = (peer) => peer.via in LINKED_VIA ? `source:${peer.via}` : `call:${peer.callsign}`;
 
   function levelFill(key) {
     const level = levels.get(key);
@@ -210,7 +221,7 @@
 
   function tickerHtml(peer) {
     const shown = syncTicker(peer).shown;
-    return `<span class="ticker-text">${text(shown)}</span>${peer.talking && peer.via !== "allstar" ? '<span class="caret">&nbsp;</span>' : ""}`;
+    return `<span class="ticker-text">${text(shown)}</span>${peer.talking && !(peer.via in LINKED_VIA) ? '<span class="caret">&nbsp;</span>' : ""}`;
   }
 
   setInterval(() => {
@@ -251,7 +262,7 @@
   // ---- Traffic ----
 
   const FLOW_WINDOW_SECONDS = 300;
-  const FLOW_SOURCES = ["rf", "reflector", "allstar"];
+  const FLOW_SOURCES = ["rf", "reflector", "allstar", "echolink"];
   const FLOW_STATIONS_SHOWN = 10;
   const FLOW = { width: 900, height: 300, padding: 22, nodeWidth: 12, leftX: 170, middleX: 444, rightX: 718, minNode: 16, gap: 10, floorUnits: 10 };
   let history = [];
@@ -262,11 +273,11 @@
     return Math.max(0, end - Math.max(transmission.started_at, now - FLOW_WINDOW_SECONDS));
   }
 
-  // Who has talked to the repeater, and what each connection on the other side has sent and been sent. A reflector is one connection, and so is each node linked into AllStar
+  // Who has talked to the repeater, and what each connection on the other side has sent and been sent. A reflector is one connection, and so is each node linked into AllStar or station linked into EchoLink
   function flowModel(now) {
-    // Only what's said by RF stations and reflectors is in the router's current transmission. Each AllStar node is followed from the peer list
+    // Only what's said by RF stations and reflectors is in the router's current transmission. Each node or station linked in is followed from the peer list
     const current = snapshot.current && ["rf", "reflector"].includes(snapshot.current.source) ? [{ ...snapshot.current, seconds: now - snapshot.current.started_at, live: true }] : [];
-    const nodesTalking = snapshot.peers.filter((peer) => peer.via === "allstar" && peer.talking && peer.talking_since).map((peer) => ({ source: "allstar", callsign: peer.callsign, started_at: peer.talking_since, seconds: now - peer.talking_since, live: true }));
+    const nodesTalking = snapshot.peers.filter((peer) => peer.via in LINKED_VIA && peer.talking && peer.talking_since).map((peer) => ({ source: peer.via, callsign: peer.callsign, started_at: peer.talking_since, seconds: now - peer.talking_since, live: true }));
     const recent = history.filter((transmission) => FLOW_SOURCES.includes(transmission.source)).map((transmission) => ({ ...transmission, live: false })).concat(current, nodesTalking)
       .map((transmission) => ({ ...transmission, inWindow: secondsInWindow(transmission, now) })).filter((transmission) => transmission.inWindow > 0);
 
@@ -280,7 +291,7 @@
 
     const connections = [];
     snapshot.links.filter((link) => link.connected && FLOW_SOURCES.includes(link.kind)).forEach((link) => {
-      if (link.kind === "allstar") link.peers.filter((peer) => peer.connected).forEach((peer) => connections.push({ name: `AllStar ${peer.id}`, owns: (transmission) => transmission.source === "allstar" && transmission.callsign === peer.id }));
+      if (link.kind in LINKED_VIA) link.peers.filter((peer) => peer.connected).forEach((peer) => connections.push({ name: `${LINKED_VIA[link.kind]} ${peer.id}`, owns: (transmission) => transmission.source === link.kind && transmission.callsign === peer.id }));
       else connections.push({ name: link.target ?? link.kind, owns: (transmission) => transmission.source === link.kind });
     });
     const total = recent.reduce((sum, transmission) => sum + transmission.inWindow, 0);
@@ -370,13 +381,22 @@
   function renderLinks() {
     const reflector = snapshot.links.find((link) => link.kind === "reflector") ?? { target: null };
     setHtml(byId("link"), !reflector.target ? "Not linked" : reflector.connected ? `<span class="good">Linked to ${text(reflector.target)}</span>` : `<span class="bad">Linking ${text(reflector.target)}…</span>`);
+    const peerState = (peer) => !peer.connected ? "Connecting…" : peer.keyed ? "Keyed" : "Idle";
+    const peerRows = (kind, action, field) => {
+      const peers = (snapshot.links.find((link) => link.kind === kind) ?? { peers: [] }).peers;
+      return peers.length ? peers.map((peer) => `<tr><td>${text(peer.id)}</td><td>${peer.mode}, ${peer.outbound ? "outbound" : "inbound"}</td><td>${peerState(peer)}</td><td style="text-align:right"><form method="post" action="${action}" style="margin:0"><input type="hidden" name="${field}" value="${text(peer.id)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>';
+    };
+    const echolink = snapshot.echolink;
+    byId("echolink-card").hidden = !echolink;
+    if (echolink) {
+      byId("echolink-callsign").textContent = echolink.callsign;
+      setHtml(byId("echolink-links"), peerRows("echolink", "/echolink/unlink", "station"));
+    }
     const allstar = snapshot.allstar;
     byId("allstar-card").hidden = !allstar;
     if (!allstar) return;
     byId("allstar-node").textContent = allstar.node;
-    const peers = (snapshot.links.find((link) => link.kind === "allstar") ?? { peers: [] }).peers;
-    const peerState = (peer) => !peer.connected ? "Connecting…" : peer.keyed ? "Keyed" : "Idle";
-    setHtml(byId("allstar-links"), peers.length ? peers.map((peer) => `<tr><td>${text(peer.id)}</td><td>${peer.mode}, ${peer.outbound ? "outbound" : "inbound"}</td><td>${peerState(peer)}</td><td style="text-align:right"><form method="post" action="/allstar/unlink" style="margin:0"><input type="hidden" name="node" value="${text(peer.id)}"><button class="plain">Unlink</button></form></td></tr>`).join("") : '<tr><td class="muted">Not linked</td></tr>');
+    setHtml(byId("allstar-links"), peerRows("allstar", "/allstar/unlink", "node"));
     setHtml(byId("allstar-schedule"), allstar.schedule.map((run) => `<tr><td>${text(run.name)}</td><td>${new Date(run.next_at * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</td></tr>`).join(""));
   }
 

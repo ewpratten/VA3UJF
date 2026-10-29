@@ -2,7 +2,7 @@
 
 mod directory;
 mod iax2;
-mod mixer;
+pub mod mixer;
 mod network;
 mod node;
 mod tokens;

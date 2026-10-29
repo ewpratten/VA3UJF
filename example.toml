@@ -64,3 +64,15 @@ actions = [{ link = "54321", permanent = true }]
 name = "Weekly Net ends"
 cron = "0 20 * * 2"
 actions = [{ unlink = "54321" }]
+
+# An EchoLink node, which is how stations on EchoLink reach the repeater. Logging in lets them find it and be recognised when they call,
+# and the password is read from the file, to keep it out of this one. Without it, only the stations listed under [echolink.stations] can link
+# [echolink]
+# callsign = "N0CALL-L"
+# ambeserver = "127.0.0.1:2460"
+# password_file = "/etc/va3ujf/echolink_password"
+# description = "Test node"
+
+# Stations can be reached at a fixed audio address instead of through the directory, which also sets where each is expected to call in from
+# [echolink.stations]
+# "W1AW-R" = "192.0.2.30:5198"

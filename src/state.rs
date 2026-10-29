@@ -102,6 +102,14 @@ pub struct AllstarStatus {
 }
 
 #[derive(Clone, Default, Serialize)]
+pub struct EcholinkStatus {
+    pub callsign: String,
+
+    // None when the node isn't set up to log in
+    pub logged_in: Option<bool>,
+}
+
+#[derive(Clone, Default, Serialize)]
 pub struct Snapshot {
     pub modem_connected: bool,
     pub modem_firmware: String,
@@ -116,6 +124,7 @@ pub struct Snapshot {
 
     // Management details that only AllStar has, beside its link
     pub allstar: Option<AllstarStatus>,
+    pub echolink: Option<EcholinkStatus>,
 
     // None when the feature isn't configured
     pub aprs_connected: Option<bool>,

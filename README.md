@@ -11,6 +11,7 @@ VA3UJF is a D-STAR repeater that supports multi-protocol links. Features include
  - Memory-safe D-STAR packet handling
  - Automatic link management
  - AllStarLink bridges
+ - EchoLink links
  - A live web UI, and Prometheus metrics at `/metrics` on the same port
 
 ## Use & Contributions
