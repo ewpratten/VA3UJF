@@ -10,7 +10,7 @@ use tokio::sync::broadcast::error::RecvError;
 const NO_LABELS: [&str; 0] = [];
 
 // Where the sources of voice are named in the metrics, so each has a count from the first scrape
-const SOURCES: [&str; 3] = ["rf", "reflector", "allstar"];
+const SOURCES: [&str; 4] = ["rf", "reflector", "allstar", "echolink"];
 
 // Bit error rates worth telling apart, as percentages
 const BER_BUCKETS: [f64; 8] = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0];
@@ -25,6 +25,7 @@ pub struct Metrics {
     // These are only given a value if the feature is set up, so they're absent otherwise
     aprs_connected: IntGaugeVec,
     allstar_registered: IntGaugeVec,
+    echolink_logged_in: IntGaugeVec,
     vocoder_connected: IntGaugeVec,
     link_connected: IntGaugeVec,
     link_peers: IntGaugeVec,
@@ -65,6 +66,7 @@ impl Metrics {
             peers_talking: register(&registry, IntGauge::new("va3ujf_peers_talking", "Stations and nodes talking right now").expect("valid metric")),
             aprs_connected: gauge_vec(&registry, "va3ujf_aprs_connected", "Whether APRS-IS is connected", &[]),
             allstar_registered: gauge_vec(&registry, "va3ujf_allstar_registered", "Whether the AllStar node is registered with AllStarLink", &[]),
+            echolink_logged_in: gauge_vec(&registry, "va3ujf_echolink_logged_in", "Whether the EchoLink node is logged in to the directory", &[]),
             vocoder_connected: gauge_vec(&registry, "va3ujf_vocoder_connected", "Whether each AMBEserver session is up", &["name"]),
             link_connected: gauge_vec(&registry, "va3ujf_link_connected", "Whether each link is connected", &["link", "kind"]),
             link_peers: gauge_vec(&registry, "va3ujf_link_peers", "Peers connected through each link", &["link", "kind"]),
@@ -106,6 +108,9 @@ impl Metrics {
         }
         if let Some(registered) = snapshot.allstar.as_ref().and_then(|allstar| allstar.registered) {
             self.allstar_registered.with_label_values(&NO_LABELS).set(registered as i64);
+        }
+        if let Some(logged_in) = snapshot.echolink.as_ref().and_then(|echolink| echolink.logged_in) {
+            self.echolink_logged_in.with_label_values(&NO_LABELS).set(logged_in as i64);
         }
         for vocoder in &snapshot.vocoders {
             self.vocoder_connected.with_label_values(&[vocoder.name]).set(vocoder.connected as i64);

@@ -11,6 +11,7 @@ pub struct Config {
     pub http_listen: Option<String>,
     pub aprs: Option<Aprs>,
     pub allstar: Option<Allstar>,
+    pub echolink: Option<Echolink>,
     pub hosts: Option<Hosts>,
     pub speech: Option<Speech>,
     pub ack: Option<Ack>,
@@ -81,6 +82,39 @@ pub struct Allstar {
     #[serde(default = "default_park_reflector")]
     pub park_reflector: bool,
     #[serde(default = "default_suffix")]
+    pub suffix: String,
+    pub message: Option<String>,
+    #[serde(default)]
+    pub rx_gain_db: f32,
+    #[serde(default)]
+    pub tx_gain_db: f32,
+}
+
+// An EchoLink node whose radio is the hotspot, linking to EchoLink stations and conferences and vocoding through an AMBEserver
+#[derive(Deserialize, Clone)]
+pub struct Echolink {
+    // The node's EchoLink callsign, which ends in -L for a link and -R for a repeater
+    pub callsign: String,
+    pub ambeserver: String,
+
+    // Logging in lets other stations find this node and be told who's allowed to call. Without it, only the stations listed below can link
+    pub password_file: Option<PathBuf>,
+
+    // Shown to other stations, and defaults to the station's callsign
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_echolink_servers")]
+    pub servers: Vec<String>,
+    #[serde(default = "default_echolink_refresh_seconds")]
+    pub refresh_seconds: u64,
+    #[serde(default = "default_echolink_port")]
+    pub udp_port: u16,
+
+    // Stations reached at a fixed "host:port" instead of through the directory, with the port being their audio port
+    #[serde(default)]
+    pub stations: HashMap<String, String>,
+    #[serde(default = "default_echolink_suffix")]
     pub suffix: String,
     pub message: Option<String>,
     #[serde(default)]
@@ -187,6 +221,10 @@ fn default_registration_interval_seconds() -> u64 { 180 }
 fn default_statpost_url() -> String { "http://stats.allstarlink.org/uhandler".to_string() }
 fn default_statpost_interval_seconds() -> u64 { 60 }
 fn default_suffix() -> String { "ASL".to_string() }
+fn default_echolink_servers() -> Vec<String> { vec!["servers.echolink.org".to_string()] }
+fn default_echolink_refresh_seconds() -> u64 { 300 }
+fn default_echolink_port() -> u16 { 5198 }
+fn default_echolink_suffix() -> String { "ECHO".to_string() }
 fn default_hosts_url() -> String { "https://raw.githubusercontent.com/g4klx/DStarGateway/master/Data/DStar_Hosts.json".to_string() }
 fn default_hosts_cache() -> PathBuf { PathBuf::from("/var/lib/va3ujf/DStar_Hosts.json") }
 fn default_hosts_refresh_hours() -> u64 { 72 }
