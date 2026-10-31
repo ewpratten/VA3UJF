@@ -21,7 +21,7 @@ impl Buffer {
         }
     }
 
-    // Playback starts once a little audio has built up, and carries on through gaps until the source is done and drained
+    // Playback starts once a little audio has built up, builds up again after running dry, and plays out what's left once the source is done
     pub fn next(&mut self, keyed: bool) -> Option<Vec<i16>> {
         if !self.playing && (self.frames.len() >= PREFILL_FRAMES || (!keyed && !self.frames.is_empty())) {
             self.playing = true;
@@ -30,7 +30,7 @@ impl Buffer {
             return None;
         }
         let frame = self.frames.pop_front();
-        if self.frames.is_empty() && !keyed {
+        if frame.is_none() || (self.frames.is_empty() && !keyed) {
             self.playing = false;
         }
         frame
@@ -77,5 +77,22 @@ mod tests {
         buffer.push(vec![3; SAMPLES_PER_FRAME]);
         assert_eq!(buffer.next(false).unwrap()[0], 3);
         assert!(!buffer.active(false));
+    }
+
+    #[test]
+    fn a_buffer_that_runs_dry_builds_up_again_before_playing_on() {
+        let mut buffer = Buffer::default();
+        buffer.push(vec![1; SAMPLES_PER_FRAME]);
+        buffer.push(vec![2; SAMPLES_PER_FRAME]);
+        assert_eq!(buffer.next(true).unwrap()[0], 1);
+        assert_eq!(buffer.next(true).unwrap()[0], 2);
+        assert!(buffer.next(true).is_none(), "the buffer ran dry");
+
+        // One late frame waits for another rather than playing straight into the next gap
+        buffer.push(vec![3; SAMPLES_PER_FRAME]);
+        assert!(buffer.next(true).is_none());
+        buffer.push(vec![4; SAMPLES_PER_FRAME]);
+        assert_eq!(buffer.next(true).unwrap()[0], 3);
+        assert!(buffer.active(true));
     }
 }

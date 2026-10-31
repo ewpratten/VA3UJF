@@ -295,6 +295,9 @@ impl Config {
         if let Some(allstar) = &config.allstar {
             crate::allstar::validate_schedule(&allstar.schedule)?;
         }
+        if config.aprs.as_ref().is_some_and(|aprs| aprs.beacon_minutes == 0) {
+            anyhow::bail!("aprs beacon_minutes must be at least 1");
+        }
         if config.speech.as_ref().is_some_and(|speech| speech.ambeserver.is_none()) && config.allstar.is_none() {
             anyhow::bail!("speech needs an AMBEserver to vocode through: set ambeserver in [speech], or add an [allstar] section to borrow its");
         }
@@ -320,6 +323,15 @@ mod tests {
         let error = super::Config::load(&path).err().expect("speech alone to be refused");
         std::fs::remove_file(&path).ok();
         assert!(format!("{error:#}").contains("[allstar]"), "{error:#}");
+    }
+
+    #[test]
+    fn a_zero_beacon_interval_is_refused() {
+        let path = std::env::temp_dir().join(format!("va3ujf-zero-beacon-{}.toml", std::process::id()));
+        std::fs::write(&path, "[station]\ncallsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0\n[modem]\nport = \"/dev/null\"\n[aprs]\nserver = \"rotate.aprs2.net:14580\"\nbeacon_minutes = 0\n").unwrap();
+        let error = super::Config::load(&path).err().expect("a zero beacon interval to be refused");
+        std::fs::remove_file(&path).ok();
+        assert!(format!("{error:#}").contains("beacon_minutes"), "{error:#}");
     }
 
     #[test]

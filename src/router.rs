@@ -41,6 +41,9 @@ struct Member {
     // Whether its transmissions are a station to list as a peer
     tracked: bool,
     to_member: mpsc::Sender<Frame>,
+
+    // Whether it's falling behind and having frames dropped, so that's only logged once
+    lagging: bool,
 }
 
 pub struct Router {
@@ -54,12 +57,21 @@ pub struct Router {
     meter: Option<mpsc::Sender<meter::Input>>,
 }
 
-async fn deliver(members: &[Member], sender: usize, frame: &Frame) {
+// A member that isn't keeping up misses frames rather than holding up everyone else
+fn deliver(members: &mut [Member], sender: usize, frame: &Frame) {
     let radio_only = members[sender].scope == Scope::LocalOnly;
-    for (index, member) in members.iter().enumerate() {
+    for (index, member) in members.iter_mut().enumerate() {
         let reaches = index != sender && member.scope == Scope::Everyone && (!radio_only || index == 0);
-        if reaches {
-            let _ = member.to_member.send(frame.clone()).await;
+        if !reaches {
+            continue;
+        }
+        match member.to_member.try_send(frame.clone()) {
+            Ok(()) => member.lagging = false,
+            Err(mpsc::error::TrySendError::Full(_)) if !member.lagging => {
+                log::warn!("{} isn't keeping up, dropping what it's sent", member.kind);
+                member.lagging = true;
+            }
+            Err(_) => {}
         }
     }
 }
@@ -99,13 +111,13 @@ impl Router {
                 }
             }
         });
-        self.members.push(Member { kind, scope, tracked, to_member });
+        self.members.push(Member { kind, scope, tracked, to_member, lagging: false });
         Port { to_router, from_router }
     }
 
     pub async fn run(self, mut taps: RadioTaps, shared: Shared) {
         // The router stops once every link has gone, which needs it to hold no handle on its own inbox
-        let Router { mut inbox, inbox_sender, members, meter } = self;
+        let Router { mut inbox, inbox_sender, mut members, meter } = self;
         drop(inbox_sender);
         let mut events = shared.subscribe_events();
         let mut decoders: Vec<Decoder> = members.iter().map(|_| Decoder::default()).collect();
@@ -129,9 +141,17 @@ impl Router {
                     continue;
                 }
                 _ = tick.tick() => {
-                    if active.as_ref().is_some_and(|holder| holder.heard.elapsed() > STREAM_TIMEOUT) {
-                        active = None;
+                    // A stream that went quiet is ended for everyone it reached, as if its end marker had arrived
+                    if let Some(holder) = active.take_if(|holder| holder.heard.elapsed() > STREAM_TIMEOUT) {
+                        log::info!("{} went quiet without ending, closing its transmission", holder.callsign);
                         state::end_transmission(&shared);
+                        if let (Scope::Everyone, Some(meter)) = (members[holder.member].scope, &meter) {
+                            let _ = meter.try_send(meter::Input::End);
+                        }
+                        let for_repeater_only = holder.member == 0 && taps.observe(&Frame::End);
+                        if !for_repeater_only {
+                            deliver(&mut members, holder.member, &Frame::End);
+                        }
                     }
                     continue;
                 }
@@ -143,7 +163,7 @@ impl Router {
                 && members[holder].scope == Scope::LocalOnly
             {
                 log::info!("Cutting off {} for someone keying up", members[holder].kind);
-                deliver(&members, holder, &Frame::End).await;
+                deliver(&mut members, holder, &Frame::End);
                 state::end_transmission(&shared);
                 active = None;
             }
@@ -212,7 +232,7 @@ impl Router {
             if for_repeater_only {
                 continue;
             }
-            deliver(&members, sender, &frame).await;
+            deliver(&mut members, sender, &frame);
         }
     }
 }
@@ -281,8 +301,8 @@ fn publish_decoded(shared: &Shared, taps: &mut RadioTaps, from_radio: bool, call
             }
 
             // Only what's heard directly over RF is the IGate's to pass on
-            if from_radio {
-                taps.gps_report(&line);
+            if from_radio && let Some(report) = dprs::aprs_line(callsign, &line) {
+                taps.gps_report(&report);
             }
             ("gps", line)
         }
@@ -649,6 +669,48 @@ mod tests {
         transmit(&bridge.to_router, "CQCQCQ").await;
         assert!(heard_header(&mut radio).await);
         assert!(state::read(&shared).peers.is_empty(), "the bridge was listed as a station");
+    }
+
+    #[tokio::test]
+    async fn a_link_that_stops_listening_does_not_hold_up_the_others() {
+        let (mut router, radio) = Router::new();
+        let _stalled = router.attach("stalled", Scope::Everyone);
+        let mut listening = router.attach("listening", Scope::Everyone);
+        tokio::spawn(router.run(RadioTaps::default(), Shared::default()));
+
+        // Far more voice than the stalled link has room for, which the other link still hears all of
+        let frames: Vec<Frame> = (0..PORT_DEPTH * 2).map(|_| Frame::Voice { sequence: 0, ambe: [1; 9], slow_data: [2; 3] }).collect();
+        tokio::spawn(async move { rf_transmission(&radio, frames).await });
+        let mut voice = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), listening.from_router.recv()).await {
+                Ok(Some(Frame::Voice { .. })) => voice += 1,
+                Ok(Some(Frame::End)) => break,
+                Ok(Some(Frame::Header(_))) => {}
+                other => panic!("the transmission stalled after {voice} frames: {other:?}"),
+            }
+        }
+        assert_eq!(voice, PORT_DEPTH * 2);
+    }
+
+    #[tokio::test]
+    async fn a_transmission_that_goes_quiet_is_ended_for_everyone_it_reached() {
+        let (mut router, radio) = Router::new();
+        let mut link = router.attach("link", Scope::Everyone);
+        tokio::spawn(router.run(RadioTaps::default(), Shared::default()));
+
+        radio.to_router.send(Frame::Header(header("CQCQCQ"))).await.unwrap();
+        radio.to_router.send(Frame::Voice { sequence: 0, ambe: [1; 9], slow_data: [2; 3] }).await.unwrap();
+        assert!(heard_header(&mut link).await);
+        let ended = async {
+            while let Some(frame) = link.from_router.recv().await {
+                if frame == Frame::End {
+                    return true;
+                }
+            }
+            false
+        };
+        assert!(tokio::time::timeout(STREAM_TIMEOUT * 2, ended).await.unwrap_or(false), "the link was never told the transmission ended");
     }
 
     #[tokio::test]

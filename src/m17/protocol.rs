@@ -114,12 +114,12 @@ impl StreamPacket {
         Self::read_from_bytes(packet).ok().filter(|stream| stream.magic == STREAM_MAGIC)
     }
 
-    // Reflectors pass on the type of whoever spoke, so the older layout and the one that replaced it both mean 3200 voice
-    pub fn is_voice_3200(&self) -> bool {
+    // Reflectors pass on the type of whoever spoke, so the older layout and the one that replaced it both mean clear 3200 voice
+    pub fn is_unencrypted_voice_3200(&self) -> bool {
         let frame_type = self.frame_type.get();
         match frame_type >> 12 {
-            0 => frame_type & 1 == 1 && (frame_type >> 1) & 0x3 == 2,
-            nibble => nibble == 2,
+            0 => frame_type & 1 == 1 && (frame_type >> 1) & 0x3 == 2 && (frame_type >> 3) & 0x3 == 0,
+            nibble => nibble == 2 && (frame_type >> 9) & 0x7 == 0,
         }
     }
 
@@ -193,13 +193,24 @@ mod tests {
     #[test]
     fn both_type_layouts_are_voice() {
         let mut packet = StreamPacket::voice(1, "W1AW", 0, [0; 16]);
-        assert!(packet.is_voice_3200());
+        assert!(packet.is_unencrypted_voice_3200());
         packet.frame_type = 0x2000.into();
-        assert!(packet.is_voice_3200());
+        assert!(packet.is_unencrypted_voice_3200());
         packet.frame_type = 0x0007.into();
-        assert!(!packet.is_voice_3200());
+        assert!(!packet.is_unencrypted_voice_3200());
         packet.frame_type = 0x3000.into();
-        assert!(!packet.is_voice_3200());
+        assert!(!packet.is_unencrypted_voice_3200());
+    }
+
+    #[test]
+    fn encrypted_voice_is_not_voice_we_can_play() {
+        let mut packet = StreamPacket::voice(1, "W1AW", 0, [0; 16]);
+        for encrypted in [0x000D, 0x0015, 0x2200, 0x2800] {
+            packet.frame_type = encrypted.into();
+            assert!(!packet.is_unencrypted_voice_3200(), "{encrypted:#06x}");
+        }
+        packet.frame_type = 0x2105.into();
+        assert!(packet.is_unencrypted_voice_3200());
     }
 
     #[test]

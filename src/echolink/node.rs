@@ -168,7 +168,10 @@ impl Node {
             }
             (Control::Bye, Some(index)) => self.link_ended(index, "disconnected"),
             (Control::Hello { callsign, name }, None) => self.handle_new(callsign, name, address.ip()),
-            (Control::Bye, None) => {}
+            // A station that hangs up while it's being checked isn't let in once it passes
+            (Control::Bye, None) => {
+                self.verifying.remove(&address.ip());
+            }
         }
     }
 
@@ -243,7 +246,9 @@ impl Node {
                 Err(error) => log::warn!("EchoLink: can't link to {target}: {error:#}"),
             },
             Internal::Verified { callsign, name, ip, verdict } => {
-                self.verifying.remove(&ip);
+                if !self.verifying.remove(&ip) {
+                    return log::info!("EchoLink: {callsign} hung up before its call was accepted");
+                }
                 match verdict {
                     Ok(address) if self.index_of_ip(ip).is_none() => self.accept_inbound(&callsign, &name, address, now),
                     Ok(_) => {}
@@ -524,6 +529,37 @@ mod tests {
         socket.send_to(&protocol::hello("N0ZZZ-L", "Intruder"), "127.0.0.1:25399").await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(has_no_links(&node));
+    }
+
+    #[tokio::test]
+    async fn a_station_that_hangs_up_while_being_checked_is_not_linked() {
+        let echolink: Echolink = toml::from_str("callsign = \"N0EEE-L\"\nambeserver = \"127.0.0.1:2460\"\nudp_port = 25698\n[stations]\n\"N0FFF-L\" = \"127.0.0.1:25798\"\n").unwrap();
+        let (internal, mut internal_receiver) = mpsc::channel(4);
+        let (to_bridge, _from_node) = mpsc::channel(4);
+        let now = Instant::now();
+        let mut node = Node {
+            name: "Test".into(),
+            directory: Arc::new(Directory::new(&echolink)),
+            echolink,
+            shared: Shared::default(),
+            audio_socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            control_socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            internal,
+            to_bridge,
+            speaker: None,
+            links: Vec::new(),
+            dstar_buffer: Buffer::default(),
+            dstar_keyed: false,
+            dstar_heard: now,
+            bridge_active: false,
+            verifying: HashSet::new(),
+        };
+        let caller: SocketAddr = "127.0.0.1:25799".parse().unwrap();
+        node.handle_control(&protocol::hello("N0FFF-L", "Caller"), caller, now);
+        node.handle_control(&protocol::bye(), caller, now);
+        let verdict = internal_receiver.recv().await.unwrap();
+        node.handle_internal(verdict, now);
+        assert!(node.links.is_empty());
     }
 
     #[tokio::test]

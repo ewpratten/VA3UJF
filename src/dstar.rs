@@ -38,8 +38,8 @@ pub enum Frame {
     End,
 }
 
-const SYNC_SLOW_DATA: [u8; 3] = [0x55, 0x2D, 0x16];
-const NULL_SLOW_DATA: [u8; 3] = [0x16, 0x29, 0xF5];
+pub const SYNC_SLOW_DATA: [u8; 3] = [0x55, 0x2D, 0x16];
+pub const NULL_SLOW_DATA: [u8; 3] = [0x16, 0x29, 0xF5];
 const SLOW_DATA_SCRAMBLER: [u8; 3] = [0x70, 0x4F, 0x93];
 
 // Lay the text message out over the first 8 frames of each superframe, then idle

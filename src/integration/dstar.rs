@@ -143,7 +143,7 @@ async fn our_reflector_client_trades_voice_with_a_real_dstargateway() {
     let heard_header = heard_header.unwrap_or_else(|| panic!("no header came through the gateway. Gateway logs:\n{}", gateway.logs()));
     assert_eq!(heard_header.my_call_text(), "N0TEST/TEST");
     assert!(heard_voice.len() >= FRAMES - 2, "only {} of {FRAMES} voice frames came through", heard_voice.len());
-    assert_eq!(heard_voice[0], voice_payload(0));
+    assert_eq!((heard_voice[0].0, heard_voice[0].1), (voice_payload(0).0, crate::dstar::SYNC_SLOW_DATA));
 
     // And our voice reaches the repeater side
     let mut header = callsign_header(HOTSPOT_CALLSIGN);

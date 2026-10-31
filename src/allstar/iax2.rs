@@ -240,6 +240,8 @@ pub enum Event {
     Cng,
     // The peer stopped acknowledging frames, so the call is gone
     Timeout,
+    // The peer doesn't know the call, so it's gone
+    Invalid,
 }
 
 struct Pending {
@@ -269,6 +271,7 @@ pub struct Session {
     sent_voice_format: u64,
     voice_format: u64,
     ping_time_ms: u64,
+    ping_sent: Option<(u32, Instant)>,
     pending: Vec<Pending>,
     next_ping: Instant,
     next_lagrq: Instant,
@@ -296,6 +299,7 @@ impl Session {
             sent_voice_format: 0,
             voice_format: 0,
             ping_time_ms: DEFAULT_PING_TIME_MS,
+            ping_sent: None,
             pending: Vec::new(),
             next_ping: now + PING_INTERVAL,
             next_lagrq: now + LAGRQ_INTERVAL,
@@ -438,7 +442,7 @@ impl Session {
         let previous = self.last_sent;
         let timestamp = self.timestamp(now, frame_type::VOICE, payload.len() as u32);
         let upper = timestamp & 0xFFFF_0000;
-        let mini = format == self.sent_voice_format && (upper == previous & 0xFFFF_0000 || upper == previous.wrapping_add(0x1_0000) & 0xFFFF_0000);
+        let mini = format == self.sent_voice_format && upper == previous & 0xFFFF_0000;
         if mini {
             let header = MiniHeader { source_call: self.local_call.into(), timestamp: (timestamp as u16).into() };
             self.outbox.push([header.as_bytes(), payload].concat());
@@ -460,10 +464,8 @@ impl Session {
 
     // Everything the peer has acknowledged can stop being retransmitted
     fn process_ack(&mut self, peer_iseq: u8) {
-        let (acknowledged, outbound) = (self.rseq, self.oseq);
-        let in_window = acknowledged >= outbound || (acknowledged <= peer_iseq && peer_iseq < outbound);
-        let limit = if in_window { peer_iseq } else { outbound };
-        if limit == outbound && outbound != peer_iseq {
+        let acknowledged = self.rseq;
+        if peer_iseq.wrapping_sub(acknowledged) > self.oseq.wrapping_sub(acknowledged) {
             return;
         }
         let mut destroy = false;
@@ -571,19 +573,29 @@ impl Session {
                 let timestamp = frame.timestamp;
                 self.emit(now, frame_type::IAX, command::LAGRP as u64, frame.payload.clone(), timestamp, None, true, false);
             }
-            command::PONG | command::LAGRP => {
-                let round_trip = self.timestamp(now, frame_type::IAX, 0).saturating_sub(frame.timestamp) as u64;
-                if command == command::PONG {
-                    self.ping_time_ms = round_trip.max(1);
+            command::PONG => {
+                if let Some((_, sent_at)) = self.ping_sent.filter(|(timestamp, _)| *timestamp == frame.timestamp) {
+                    self.ping_time_ms = (now.saturating_duration_since(sent_at).as_millis() as u64).max(1);
+                    self.ping_sent = None;
                 }
             }
+            command::LAGRP => {}
             command::VNAK => {
-                let sequence = frame.iseq;
-                let due: Vec<Vec<u8>> = self.pending.iter().filter(|pending| pending.frame.oseq.wrapping_sub(sequence) < 128).map(|pending| pending.frame.to_bytes()).collect();
+                let (sequence, iseq) = (frame.iseq, self.iseq);
+                let due: Vec<Vec<u8>> = self
+                    .pending
+                    .iter_mut()
+                    .filter(|pending| pending.frame.oseq.wrapping_sub(sequence) < 128)
+                    .map(|pending| {
+                        (pending.frame.retransmission, pending.frame.iseq) = (true, iseq);
+                        pending.frame.to_bytes()
+                    })
+                    .collect();
                 self.outbox.extend(due);
             }
             command::INVAL => {
                 self.destroy();
+                return vec![Event::Invalid];
             }
             command::CALLTOKEN => {
                 if let (Some(token), Some(elements)) = (ies.get(ie::CALLTOKEN), self.new_elements.clone()) {
@@ -637,6 +649,7 @@ impl Session {
             if now >= self.next_ping {
                 self.next_ping = now + PING_INTERVAL;
                 self.send_iax(now, command::PING, Ies::default());
+                self.ping_sent = Some((self.last_sent, now));
             }
             if now >= self.next_lagrq {
                 self.next_lagrq = now + LAGRQ_INTERVAL;
@@ -732,6 +745,72 @@ mod tests {
         let events = deliver(&mut sender, &mut receiver, now);
         assert_eq!(events.len(), 3);
         assert!(events.iter().all(|event| matches!(event, Event::Voice { payload, .. } if payload.len() == 160)));
+    }
+
+    #[test]
+    fn voice_crossing_a_16_bit_timestamp_boundary_goes_out_as_a_full_frame() {
+        let now = Instant::now();
+        let mut sender = Session::new(2, 3, address(), now);
+        sender.start(FORMAT_ULAW);
+        for index in 0..3u64 {
+            sender.send_voice(now + Duration::from_millis(65_500 + index * 20), FORMAT_ULAW, &[0x7F; 160]);
+        }
+        let sizes: Vec<usize> = sender.outbox.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [12 + 160, 4 + 160, 12 + 160]);
+    }
+
+    #[test]
+    fn stale_acknowledgements_across_the_sequence_wrap_are_ignored() {
+        let now = Instant::now();
+        let mut session = Session::new(2, 3, address(), now);
+        (session.oseq, session.rseq) = (254, 254);
+        for _ in 0..4 {
+            session.send_control(now, control::RADIO_KEY);
+        }
+        session.process_ack(253);
+        assert_eq!((session.pending.len(), session.rseq), (4, 254));
+        session.process_ack(0);
+        assert_eq!((session.pending.len(), session.rseq), (2, 0));
+    }
+
+    #[test]
+    fn an_invalid_reply_ends_the_call_with_an_event() {
+        let now = Instant::now();
+        let mut session = Session::new(2, 3, address(), now);
+        session.start(FORMAT_ULAW);
+        let invalid = FullFrame { source_call: 3, dest_call: 2, retransmission: false, timestamp: 0, oseq: 0, iseq: 0, frame_type: frame_type::IAX, subclass: command::INVAL as u64, payload: Vec::new() };
+        assert_eq!(session.handle_full(now, invalid), vec![Event::Invalid]);
+        assert!(session.destroyed);
+    }
+
+    #[test]
+    fn a_vnak_resends_pending_frames_marked_as_retransmissions() {
+        let now = Instant::now();
+        let mut session = Session::new(2, 3, address(), now);
+        session.send_control(now, control::RADIO_KEY);
+        session.take_outbox();
+        session.iseq = 5;
+        let vnak = FullFrame { source_call: 3, dest_call: 2, retransmission: false, timestamp: 0, oseq: 5, iseq: 0, frame_type: frame_type::IAX, subclass: command::VNAK as u64, payload: Vec::new() };
+        session.handle_full(now, vnak);
+        let Some(Datagram::Full(frame)) = session.take_outbox().first().and_then(|bytes| parse(bytes)) else { panic!("nothing resent") };
+        assert_eq!((frame.retransmission, frame.subclass, frame.iseq), (true, control::RADIO_KEY as u64, 5));
+    }
+
+    #[test]
+    fn the_round_trip_is_timed_from_when_the_ping_went_out() {
+        let now = Instant::now();
+        let mut pinger = Session::new(2, 3, address(), now);
+        let mut ponger = Session::new(3, 2, address(), now);
+        pinger.start(FORMAT_ULAW);
+        ponger.start(FORMAT_ULAW);
+
+        // Voice running ahead of the clock pushes the ping's timestamp past the time it was sent
+        let ping_time = now + PING_INTERVAL;
+        pinger.send_voice(ping_time - Duration::from_millis(10), FORMAT_ULAW, &[0x7F; 160]);
+        pinger.poll(ping_time);
+        deliver(&mut pinger, &mut ponger, ping_time);
+        deliver(&mut ponger, &mut pinger, ping_time + Duration::from_millis(80));
+        assert_eq!(pinger.ping_time_ms, 80);
     }
 
     #[test]

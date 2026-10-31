@@ -4,12 +4,19 @@ use crate::dstar::crc_ccitt;
 
 const SENTENCE_START: &[u8] = b"$$CRC";
 const SENTENCE_END: u8 = b'\r';
+const NMEA_END: u8 = b'\n';
 const MAX_BUFFERED_BYTES: usize = 512;
+const NMEA_SYMBOL_TABLE: char = '\\';
+const NMEA_SYMBOL: char = 'K';
+
+// Path elements that mark a packet as already from the internet, or as not to be put on it
+const UNGATEABLE_HOPS: [&str; 4] = ["TCPIP", "TCPXX", "NOGATE", "RFONLY"];
 
 // GPS blocks carry a sentence five bytes at a time
 #[derive(Default)]
 pub struct Sentences {
     buffer: Vec<u8>,
+    heard_gga: bool,
 }
 
 impl Sentences {
@@ -23,12 +30,68 @@ impl Sentences {
         self.take_sentence()
     }
 
+    // A "$$CRC" sentence runs to a carriage return, and an NMEA one, from a radio in GPS mode, to a line feed
     fn take_sentence(&mut self) -> Option<String> {
-        let start = self.buffer.windows(SENTENCE_START.len()).position(|window| window == SENTENCE_START)?;
-        let end = start + self.buffer[start..].iter().position(|byte| *byte == SENTENCE_END)?;
-        let sentence: Vec<u8> = self.buffer.drain(..=end).skip(start).map(|byte| byte & 0x7F).collect();
-        parse_sentence(&sentence)
+        loop {
+            let start = self.buffer.iter().position(|byte| *byte == b'$')?;
+            self.buffer.drain(..start);
+            let prefix_length = self.buffer.len().min(SENTENCE_START.len());
+            let is_crc_sentence = self.buffer[..prefix_length] == SENTENCE_START[..prefix_length];
+            if is_crc_sentence && prefix_length < SENTENCE_START.len() {
+                return None;
+            }
+            if !is_crc_sentence && self.buffer.get(1) == Some(&b'$') {
+                self.buffer.remove(0);
+                continue;
+            }
+            let terminator = if is_crc_sentence { SENTENCE_END } else { NMEA_END };
+            let end = self.buffer.iter().position(|byte| *byte == terminator);
+            let next_start = self.buffer.iter().skip(1).position(|byte| *byte == b'$').map(|position| position + 1);
+            if let (false, Some(next_start)) = (is_crc_sentence, next_start)
+                && end.is_none_or(|end| next_start < end)
+            {
+                self.buffer.drain(..next_start);
+                continue;
+            }
+            let sentence: Vec<u8> = self.buffer.drain(..=end?).map(|byte| byte & 0x7F).collect();
+            let line = if is_crc_sentence { parse_sentence(&sentence) } else { parse_nmea(&sentence).and_then(|line| self.wanted_nmea(line)) };
+            if line.is_some() {
+                return line;
+            }
+        }
     }
+
+    // GGA and RMC both say where the radio is, so RMC is only passed on when a transmission has no GGA
+    fn wanted_nmea(&mut self, line: String) -> Option<String> {
+        match line.get(3..6)? {
+            "GGA" => self.heard_gga = true,
+            "RMC" if !self.heard_gga => {}
+            _ => return None,
+        }
+        Some(line)
+    }
+}
+
+// Check an NMEA sentence's XOR checksum, and return the sentence without it
+fn parse_nmea(sentence: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(sentence).ok()?.trim_end();
+    let (body, checksum) = text.strip_prefix('$')?.rsplit_once('*')?;
+    let expected = u8::from_str_radix(checksum, 16).ok()?;
+    if body.bytes().fold(0, |sum, byte| sum ^ byte) != expected {
+        log::debug!("NMEA sentence failed its checksum: {text}");
+        return None;
+    }
+    Some(format!("${body}"))
+}
+
+// The line to gate for a report heard from a station: a TNC-2 line as it is, or an NMEA position made into one from the station's callsign
+pub fn aprs_line(callsign: &str, line: &str) -> Option<String> {
+    if !line.starts_with('$') {
+        return Some(line.to_string());
+    }
+    let fix = nmea_fix(line)?;
+    let source = callsign.split(['/', ' ']).next().filter(|source| !source.is_empty())?;
+    Some(format!("{source}>APDPRS,DSTAR*:!{}{NMEA_SYMBOL_TABLE}{}{NMEA_SYMBOL}", crate::aprs::coordinate(fix.latitude, 'N', 'S', 2), crate::aprs::coordinate(fix.longitude, 'E', 'W', 3)))
 }
 
 // Check the "$$CRCxxxx," prefix against the CRC of everything after it, and return the line it carries
@@ -52,7 +115,7 @@ pub fn gate(line: &str, igate: &str) -> Option<String> {
     if hops.len() < 2 || hops.iter().any(|hop| hop.is_empty()) || body.is_empty() {
         return None;
     }
-    if hops[2..].iter().any(|hop| hop.starts_with('q')) {
+    if hops[2..].iter().any(|hop| hop.starts_with('q') || UNGATEABLE_HOPS.contains(&hop.trim_end_matches('*').to_ascii_uppercase().as_str())) {
         return None;
     }
     Some(format!("{header},qAR,{igate}:{body}"))
@@ -128,13 +191,16 @@ pub mod testing {
     // Lay a sentence out the way a radio sends it: sync, then scrambled GPS blocks of five bytes over two frames each
     pub fn slow_data_frames(payload: &str) -> Vec<[u8; 3]> {
         let crc = crc_ccitt(payload.as_bytes());
-        let mut sentence = format!("$$CRC{crc:04X},{payload}").into_bytes();
-        while sentence.len() % 5 != 0 {
-            sentence.push(b'f');
-        }
+        gps_frames(&format!("$$CRC{crc:04X},{payload}"))
+    }
+
+    // Any text as GPS blocks, with the last one padded and its length saying so
+    pub fn gps_frames(text: &str) -> Vec<[u8; 3]> {
         let mut frames = vec![SYNC_SLOW_DATA];
-        for chunk in sentence.chunks(5) {
-            let block = [&[BLOCK_TYPE_GPS | 5][..], chunk].concat();
+        for chunk in text.as_bytes().chunks(5) {
+            let mut padded = [b'f'; 5];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            let block = [&[BLOCK_TYPE_GPS | chunk.len() as u8][..], &padded].concat();
             for half in block.chunks(3) {
                 frames.push(std::array::from_fn(|index| half[index] ^ SLOW_DATA_SCRAMBLER[index]));
             }
@@ -147,7 +213,7 @@ pub mod testing {
 mod tests {
     use super::*;
 
-    use super::testing::slow_data_frames;
+    use super::testing::{gps_frames, slow_data_frames};
     use crate::slowdata::{Decoded, Decoder};
 
     const REPORT: &str = "N0CALL>API282,DSTAR*:!4500.00N/09000.00W>Test\r";
@@ -174,6 +240,47 @@ mod tests {
         let mut frames = slow_data_frames(REPORT);
         frames[4][0] ^= 0x01;
         assert_eq!(collect(frames), None);
+    }
+
+    const GGA: &str = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47";
+    const RMC: &str = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
+
+    fn collect_all(frames: Vec<[u8; 3]>) -> Vec<String> {
+        let mut decoder = Decoder::default();
+        frames.into_iter().filter_map(|frame| match decoder.push(frame) {
+            Some(Decoded::Gps(line)) => Some(line),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn nmea_positions_are_collected_preferring_gga() {
+        let both = collect_all(gps_frames(&format!("{GGA}\r\nVA3UJF  ,BEACON*00\r\n{RMC}\r\n")));
+        assert_eq!(both, [GGA.split_once('*').unwrap().0]);
+        let rmc_only = collect_all(gps_frames(&format!("{RMC}\r\n")));
+        assert_eq!(rmc_only, [RMC.split_once('*').unwrap().0]);
+        assert!(collect_all(gps_frames(&format!("{}\r\n", GGA.replace("*47", "*48")))).is_empty());
+    }
+
+    #[test]
+    fn short_gps_blocks_carry_only_the_bytes_they_say() {
+        let mut frames = gps_frames("$GPG");
+        frames.extend(gps_frames(&format!("{}\r\n", &GGA[4..])).into_iter().skip(1));
+        assert_eq!(collect_all(frames).len(), 1);
+    }
+
+    #[test]
+    fn nmea_positions_are_gated_under_the_callsign_that_sent_them() {
+        let line = collect_all(gps_frames(&format!("{GGA}\r\n"))).remove(0);
+        assert_eq!(aprs_line("VA3UJF/ID51", &line).as_deref(), Some("VA3UJF>APDPRS,DSTAR*:!4807.04N\\01131.00EK"));
+        assert_eq!(aprs_line("VA3UJF", "VA3UJF>API51:!4500.00N/09000.00W>").as_deref(), Some("VA3UJF>API51:!4500.00N/09000.00W>"));
+    }
+
+    #[test]
+    fn gating_refuses_internet_and_rf_only_paths() {
+        assert_eq!(gate("N0CALL>APRS,TCPIP*:!4500.00N/09000.00W>", "N0CALL-10"), None);
+        assert_eq!(gate("N0CALL>APRS,NOGATE:!4500.00N/09000.00W>", "N0CALL-10"), None);
+        assert_eq!(gate("N0CALL>APRS,RFONLY,WIDE1-1:!4500.00N/09000.00W>", "N0CALL-10"), None);
     }
 
     #[test]

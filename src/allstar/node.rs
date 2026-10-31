@@ -32,6 +32,9 @@ const REDUNDANT_TIMEOUT: Duration = Duration::from_secs(10);
 const LINK_LIST_INTERVAL: Duration = Duration::from_secs(30);
 const LINK_LIST_SOON: Duration = Duration::from_millis(200);
 
+// Keeps a link list inside one unfragmented datagram
+const MAX_LINK_LIST_LENGTH: usize = 1200;
+
 // A link that goes quiet without a key-up is treated as unkeyed after this long. App_rpt's own 50 ms assumes its jitter buffer
 const RX_LINGER: Duration = Duration::from_millis(300);
 const TALKER_TIMEOUT: Duration = Duration::from_millis(500);
@@ -167,6 +170,32 @@ fn adjust_listed_mode(through: char, entry: &str) -> String {
     format!("{adjusted}{}", characters.as_str())
 }
 
+// The links a node has beyond the one the list is for, then the nodes behind each, flattened. Each node is listed once, and never the target or the node itself
+fn build_link_list(own_node: &str, target: &str, links: &[Link]) -> String {
+    let listed_links: Vec<&Link> = links.iter().filter(|link| link.node != target && !link.node.starts_with('0')).collect();
+    let mut candidates: Vec<String> = listed_links.iter().map(|link| format!("{}{}", link.mode_letter(), link.node)).collect();
+    for link in &listed_links {
+        candidates.extend(link.remote_list.split(',').filter(|entry| !entry.is_empty()).map(|entry| adjust_listed_mode(link.mode_letter(), entry)));
+    }
+    let mut seen_nodes = HashSet::from([own_node.to_string(), target.to_string()]);
+    let mut entries = Vec::new();
+    let mut length = 2;
+    for candidate in candidates {
+        let mut characters = candidate.chars();
+        characters.next();
+        let listed_node = characters.as_str();
+        if !is_node_number(listed_node) || !seen_nodes.insert(listed_node.to_string()) {
+            continue;
+        }
+        if length + candidate.len() + 1 > MAX_LINK_LIST_LENGTH {
+            break;
+        }
+        length += candidate.len() + 1;
+        entries.push(candidate);
+    }
+    format!("L {}", entries.join(","))
+}
+
 impl Node {
     fn index_of(&self, node: &str) -> Option<usize> {
         self.links.iter().position(|link| link.node == node)
@@ -189,6 +218,12 @@ impl Node {
             if finished {
                 self.links[index].session = None;
             }
+        }
+
+        // Links that are still wanted dial again once their hangup is done, and the rest are forgotten
+        let redialing: Vec<String> = self.links.iter().filter(|link| link.wanted && link.closing_since.is_some() && link.session.is_none()).map(|link| link.node.clone()).collect();
+        for node in redialing {
+            self.link_lost(&node, "hung up", Instant::now());
         }
         let before = self.links.len();
         self.links.retain(|link| !(link.closing_since.is_some() && link.session.is_none()));
@@ -316,6 +351,11 @@ impl Node {
     }
 
     fn accept_inbound(&mut self, frame: FullFrame, address: SocketAddr, node: &str, now: Instant) {
+        // When two nodes call each other at once, the call from the lower-numbered node is the one kept
+        let existing = self.index_of(node).map(|index| &self.links[index]);
+        if existing.is_some_and(|link| link.outbound && link.wanted && link.session.is_some()) &&node.parse::<u32>().is_ok_and(|calling| self.allstar.node < calling) {
+            return self.reject_without_session(address, &frame, "Already calling that node");
+        }
         let call = self.allocate_call();
         let mut session = Session::new(call, frame.source_call, address, now);
 
@@ -325,9 +365,13 @@ impl Node {
         session.send_iax(now, command::ACCEPT, Ies::default().add_u32(ie::FORMAT, FORMAT_ULAW as u32).add_versioned_u64(ie::FORMAT2, FORMAT_ULAW));
         session.send_control(now, control::ANSWER);
 
-        // A node calling again replaces its stale link
+        // A node calling again replaces its stale link, keeping how it was wanted
+        let mut link = Link::new(node, LinkMode::Transceive, false, false, now);
         if let Some(index) = self.index_of(node) {
             let mut old = self.links.remove(index);
+            if old.wanted {
+                (link.mode, link.outbound, link.permanent) = (old.mode, old.outbound, old.permanent);
+            }
             if let Some(old_session) = old.session.as_mut() {
                 old_session.hangup(now, "Replaced by a new link");
                 for bytes in old_session.take_outbox() {
@@ -335,7 +379,6 @@ impl Node {
                 }
             }
         }
-        let mut link = Link::new(node, LinkMode::Transceive, false, false, now);
         link.session = Some(session);
         self.links.push(link);
         log::info!("AllStar: node {node} linked in from {address}");
@@ -423,7 +466,7 @@ impl Node {
     fn handle_internal(&mut self, internal: Internal, now: Instant) {
         match internal {
             Internal::Resolved { node, addresses } => {
-                let Some(index) = self.index_of(&node) else { return };
+                let Some(index) = self.index_of(&node).filter(|index| self.links[*index].resolving) else { return };
                 self.links[index].resolving = false;
                 match addresses.map(|addresses| addresses.into_iter().next()) {
                     Ok(Some(address)) if self.links[index].wanted => self.start_call(&node, address, now),
@@ -487,7 +530,14 @@ impl Node {
         if was_up {
             speech::say(&self.speaker, format!("Node {} disconnected.", speech::spelled(node)));
         }
-        (link.up, link.tx_keyed, link.rx_keyed, link.session, link.resolving) = (false, false, false, None, false);
+
+        // Whatever the call still owes the peer, like the acknowledgement of its hangup, goes out before it's dropped
+        if let Some(mut session) = link.session.take() {
+            for bytes in session.take_outbox() {
+                let _ = self.socket.try_send_to(&bytes, session.addr);
+            }
+        }
+        (link.up, link.tx_keyed, link.rx_keyed, link.resolving, link.closing_since, link.hangup_at) = (false, false, false, false, None, None);
         link.remote_list.clear();
         let redial = link.wanted && (link.outbound || link.permanent) && (link.permanent || link.retries < MAX_RETRIES);
         if redial {
@@ -549,6 +599,7 @@ impl Node {
                     }
                 }
                 Event::Timeout => self.link_lost(node, "no response", now),
+                Event::Invalid => self.link_lost(node, "the far end doesn't know the call", now),
             }
         }
     }
@@ -709,18 +760,8 @@ impl Node {
 
     // ---- Link lists ----
 
-    // The links this node has beyond the one the list is for, with the nodes behind each, flattened
     fn link_list(&self, target: &str) -> String {
-        let mut entries = Vec::new();
-        for link in &self.links {
-            if link.node == target || link.node.starts_with('0') {
-                continue;
-            }
-            let letter = link.mode_letter();
-            entries.push(format!("{letter}{}", link.node));
-            entries.extend(link.remote_list.split(',').filter(|entry| !entry.is_empty()).map(|entry| adjust_listed_mode(letter, entry)));
-        }
-        format!("L {}", entries.join(","))
+        build_link_list(&self.own_node(), target, &self.links)
     }
 
     // New links show up in everyone's lists within a fraction of a second
@@ -878,6 +919,73 @@ mod tests {
         assert_eq!(adjust_listed_mode('R', "R2000"), "R2000");
         assert_eq!(adjust_listed_mode('C', "T2000"), "C2000");
         assert_eq!(adjust_listed_mode('C', "R2000"), "C2000");
+    }
+
+    #[test]
+    fn link_lists_name_each_node_once_and_leave_out_the_target_and_this_node() {
+        let now = Instant::now();
+        let mut left = Link::new("2000", LinkMode::Transceive, true, false, now);
+        let mut right = Link::new("3000", LinkMode::Transceive, false, false, now);
+        (left.up, right.up) = (true, true);
+        left.remote_list = "T1000,T3000,T4000,T4000,Tjunk".to_string();
+        right.remote_list = "T2000,T4000,T5000".to_string();
+        assert_eq!(build_link_list("1000", "9000", &[left, right]), "L T2000,T3000,T4000,T5000");
+    }
+
+    #[test]
+    fn link_lists_stay_short_however_big_the_network_behind_them() {
+        let mut hub = Link::new("2000", LinkMode::Transceive, true, false, Instant::now());
+        hub.up = true;
+        hub.remote_list = (10_000..12_000).map(|node| format!("T{node}")).collect::<Vec<_>>().join(",");
+        let list = build_link_list("1000", "9000", &[hub]);
+        assert!(list.len() <= MAX_LINK_LIST_LENGTH && list.starts_with("L T2000,T10000,"), "{} bytes", list.len());
+    }
+
+    // Two nodes that call each other at the same moment end up with one link between them
+    #[tokio::test]
+    async fn nodes_calling_each_other_at_once_keep_one_link() {
+        let first = start_node(10031, 24576, &[(10032, "127.0.0.1:24577".into())]);
+        let second = start_node(10032, 24577, &[(10031, "127.0.0.1:24576".into())]);
+        let link = |node: &str| crate::config::Action { link: Some(node.into()), permanent: true, ..Default::default() };
+        let (to_second, to_first) = (link("10032"), link("10031"));
+        let (first_linked, second_linked) = tokio::join!(first.handle.run_action(&to_second), second.handle.run_action(&to_first));
+        first_linked.unwrap();
+        second_linked.unwrap();
+        wait_for("both nodes to show the link", || linked(&first, "10032") && linked(&second, "10031")).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(linked(&first, "10032") && linked(&second, "10031"), "the link didn't last");
+        assert_eq!((state::read(&first.shared).links.iter().map(|link| link.peers.len()).sum::<usize>(), state::read(&second.shared).links.iter().map(|link| link.peers.len()).sum::<usize>()), (1, 1));
+    }
+
+    // A permanent link hung up on for something the far end asked for is dialled again once the hangup is done
+    #[tokio::test]
+    async fn a_permanent_link_hung_up_on_dials_again() {
+        let far_end = UdpSocket::bind("127.0.0.1:24579").await.unwrap();
+        let node = start_node(10041, 24578, &[(10042, "127.0.0.1:24579".into())]);
+        node.handle.run_action(&crate::config::Action { link: Some("10042".into()), permanent: true, ..Default::default() }).await.unwrap();
+
+        // Ask for authentication, which the node doesn't support, and acknowledge everything it sends
+        let mut buffer = [0u8; 2048];
+        let mut calls = 0;
+        let mut far_end_oseq = 0u8;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls < 2 {
+            let (length, address) = tokio::time::timeout_at(deadline, far_end.recv_from(&mut buffer)).await.expect("the node to call again").unwrap();
+            let Some(Datagram::Full(frame)) = iax2::parse(&buffer[..length]) else { continue };
+            let is_iax = frame.frame_type == iax2::frame_type::IAX;
+            if is_iax && frame.subclass == command::ACK as u64 {
+                continue;
+            }
+            let reply = |subclass: u8, oseq: u8| FullFrame { source_call: 5, dest_call: frame.source_call, retransmission: false, timestamp: frame.timestamp, oseq, iseq: frame.oseq.wrapping_add(1), frame_type: iax2::frame_type::IAX, subclass: subclass as u64, payload: Vec::new() };
+            if is_iax && frame.subclass == command::NEW as u64 {
+                calls += 1;
+                far_end_oseq = 0;
+                far_end.send_to(&reply(command::AUTHREQ, far_end_oseq).to_bytes(), address).await.unwrap();
+                far_end_oseq += 1;
+            } else {
+                far_end.send_to(&reply(command::ACK, far_end_oseq).to_bytes(), address).await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]
