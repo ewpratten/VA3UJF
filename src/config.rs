@@ -12,6 +12,7 @@ pub struct Config {
     pub aprs: Option<Aprs>,
     pub allstar: Option<Allstar>,
     pub echolink: Option<Echolink>,
+    pub m17: Option<M17>,
     pub hosts: Option<Hosts>,
     pub speech: Option<Speech>,
     pub voice_control: Option<VoiceControl>,
@@ -116,6 +117,29 @@ pub struct Echolink {
     #[serde(default)]
     pub stations: HashMap<String, String>,
     #[serde(default = "default_echolink_suffix")]
+    pub suffix: String,
+    pub message: Option<String>,
+    #[serde(default)]
+    pub rx_gain_db: f32,
+    #[serde(default)]
+    pub tx_gain_db: f32,
+}
+
+// A client of one M17 reflector at a time, vocoding its Codec 2 voice to and from D-STAR through an AMBEserver
+#[derive(Deserialize, Clone)]
+pub struct M17 {
+    pub ambeserver: String,
+
+    // The callsign the reflector sees, which defaults to the station's
+    pub callsign: Option<String>,
+
+    // Reflectors by name, each at "host" or "host:port", with the port defaulting to 17000
+    #[serde(default)]
+    pub reflectors: HashMap<String, String>,
+
+    // Linked at startup, written as "NAME M"
+    pub startup_reflector: Option<String>,
+    #[serde(default = "default_m17_suffix")]
     pub suffix: String,
     pub message: Option<String>,
     #[serde(default)]
@@ -254,6 +278,7 @@ fn default_echolink_servers() -> Vec<String> { vec!["servers.echolink.org".to_st
 fn default_echolink_refresh_seconds() -> u64 { 300 }
 fn default_echolink_port() -> u16 { 5198 }
 fn default_echolink_suffix() -> String { "ECHO".to_string() }
+fn default_m17_suffix() -> String { "M17".to_string() }
 fn default_hosts_url() -> String { "https://raw.githubusercontent.com/g4klx/DStarGateway/master/Data/DStar_Hosts.json".to_string() }
 fn default_hosts_cache() -> PathBuf { PathBuf::from("/var/lib/va3ujf/DStar_Hosts.json") }
 fn default_hosts_refresh_hours() -> u64 { 72 }
