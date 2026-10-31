@@ -28,8 +28,9 @@ pub fn containers_available() -> bool {
     available
 }
 
-pub fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap()
+// The image is built from the crate's own directory, which is the root of its published repo
+pub fn crate_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 pub fn container_assets(name: &str) -> PathBuf {

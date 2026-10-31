@@ -6,11 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /
 WORKDIR /usr/src/va3ujf
 
 # Build dependencies in their own layer so source changes don't rebuild them
-COPY Cargo.toml ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
 
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 # The voice announcements are spoken in, with its checksum, so a changed download can't slip in
 FROM debian:trixie-slim AS voice

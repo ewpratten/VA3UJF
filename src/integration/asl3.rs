@@ -1,6 +1,6 @@
 // Links this program's node against a real AllStarLink 3 node (app_rpt on Asterisk)
 
-use super::{build_image, container_assets, containers_available, repository_root, Container, Network};
+use super::{build_image, container_assets, containers_available, crate_root, Container, Network};
 use crate::allstar::testing::*;
 use crate::config::Action;
 use std::time::Duration;
@@ -94,8 +94,8 @@ async fn asl3_links_to_our_container_and_hangs_up_on_it() {
     }
     let network = Network::create().unwrap();
     let hub = Asl3::start("hotspot:4569", Some(&network)).unwrap();
-    let root = repository_root();
-    build_image("va3ujf-test", &root.join("subprojects/apps/va3ujf/Dockerfile"), &root).unwrap();
+    let root = crate_root();
+    build_image("va3ujf-test", &root.join("Dockerfile"), &root).unwrap();
 
     let directory = std::env::temp_dir().join(format!("va3ujf-test-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
@@ -114,10 +114,13 @@ async fn asl3_links_to_our_container_and_hangs_up_on_it() {
         let response = reqwest::get(format!("http://127.0.0.1:{web_port}/api/status")).await.ok()?;
         response.json::<serde_json::Value>().await.ok()
     };
+
+    // The nodes our AllStar link reports, as the status page lists them
+    let allstar_peers = |status: serde_json::Value| status["links"].as_array().and_then(|links| links.iter().find(|link| link["name"] == "allstar")).and_then(|link| link["peers"].as_array().cloned());
     hub.cli(&format!("rpt cmd {HUB} ilink 3 {OUR_NODE}"));
     let mut linked = false;
     for _ in 0..100 {
-        linked = status().await.is_some_and(|status| status["allstar"]["links"].as_array().is_some_and(|links| links.iter().any(|link| link["node"] == HUB && link["connected"] == true)));
+        linked = status().await.and_then(allstar_peers).is_some_and(|peers| peers.iter().any(|peer| peer["id"] == HUB && peer["connected"] == true));
         if linked {
             break;
         }
@@ -130,7 +133,7 @@ async fn asl3_links_to_our_container_and_hangs_up_on_it() {
     hub.cli(&format!("rpt cmd {HUB} ilink 1 {OUR_NODE}"));
     let mut dropped = false;
     for _ in 0..100 {
-        dropped = status().await.is_some_and(|status| status["allstar"]["links"].as_array().is_some_and(|links| links.is_empty()));
+        dropped = status().await.and_then(allstar_peers).is_some_and(|peers| peers.is_empty());
         if dropped {
             break;
         }

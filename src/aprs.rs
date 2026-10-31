@@ -7,12 +7,17 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep};
+use anyhow::Context;
+use tokio::time::{interval, sleep, sleep_until, timeout, Instant};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+// Servers send a comment line about every 20 seconds, so this much silence means the connection is gone
+const SERVER_SILENCE_LIMIT: Duration = Duration::from_secs(60);
 
 // APRS wants degrees and decimal minutes, e.g. 4324.56N
-fn coordinate(value: f64, positive: char, negative: char, degree_digits: usize) -> String {
+pub fn coordinate(value: f64, positive: char, negative: char, degree_digits: usize) -> String {
     let degrees = value.abs().trunc();
     let minutes = (value.abs() - degrees) * 60.0;
     format!("{:0width$}{:05.2}{}", degrees as u32, minutes, if value >= 0.0 { positive } else { negative }, width = degree_digits)
@@ -31,20 +36,27 @@ fn beacon_text(station: &Station) -> String {
     format!("{0}>APZVA3,TCPIP*:!{1}/{2}-{0} Homebrew Repeater\r\n", station.callsign, coordinate(station.latitude, 'N', 'S', 2), coordinate(station.longitude, 'E', 'W', 3))
 }
 
+// What the server said about the login, if the line is its answer
+fn login_verified(line: &str) -> Option<bool> {
+    let response = line.strip_prefix("# logresp ")?;
+    Some(!response.contains("unverified") && response.contains("verified"))
+}
+
 async fn session(station: &Station, aprs: &Aprs, shared: &Shared, reports: &mut mpsc::Receiver<String>) -> anyhow::Result<()> {
-    let stream = TcpStream::connect(&aprs.server).await?;
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(&aprs.server)).await.context("timed out connecting")??;
     let (reader, mut writer) = stream.into_split();
     let igate = station.callsign.clone();
     let login = format!("user {igate} pass {} vers va3ujf 0.1\r\n", passcode(&station.callsign));
     writer.write_all(login.as_bytes()).await?;
     log::info!("Connected to APRS-IS at {} as {igate}", aprs.server);
-    state::update(shared, |snapshot| snapshot.aprs_connected = Some(true));
 
-    // Beacon on a timer while draining the server's lines so the connection stays healthy
+    // Beacon on a timer while draining the server's lines, which keep coming while the connection is alive
     let mut lines = BufReader::new(reader).lines();
     let mut beacon_timer = interval(Duration::from_secs(aprs.beacon_minutes * 60));
+    let mut last_line = Instant::now();
     loop {
         tokio::select! {
+            _ = sleep_until(last_line + SERVER_SILENCE_LIMIT) => anyhow::bail!("server went quiet"),
             _ = beacon_timer.tick() => {
                 log::debug!("Beaconing position");
                 writer.write_all(beacon_text(station).as_bytes()).await?;
@@ -56,10 +68,16 @@ async fn session(station: &Station, aprs: &Aprs, shared: &Shared, reports: &mut 
                 }
                 None => log::warn!("Dropping unusable D-PRS report: {report}"),
             },
-            line = lines.next_line() => match line? {
-                Some(line) => log::debug!("APRS-IS: {line}"),
-                None => anyhow::bail!("server closed the connection"),
-            },
+            line = lines.next_line() => {
+                let Some(line) = line? else { anyhow::bail!("server closed the connection") };
+                last_line = Instant::now();
+                log::debug!("APRS-IS: {line}");
+                match login_verified(&line) {
+                    Some(true) => state::update(shared, |snapshot| snapshot.aprs_connected = Some(true)),
+                    Some(false) => anyhow::bail!("server didn't verify the login, so it would drop everything gated: {line}"),
+                    None => {}
+                }
+            }
         }
     }
 }
@@ -84,6 +102,13 @@ mod tests {
     fn beacon_is_sent_as_the_bare_callsign() {
         let station: Station = toml::from_str("callsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.5\nlongitude = -90.25").unwrap();
         assert_eq!(super::beacon_text(&station), "N0CALL>APZVA3,TCPIP*:!4530.00N/09015.00W-N0CALL Homebrew Repeater\r\n");
+    }
+
+    #[test]
+    fn the_login_response_is_read() {
+        assert_eq!(super::login_verified("# logresp N0CALL verified, server T2TEST"), Some(true));
+        assert_eq!(super::login_verified("# logresp N0CALL unverified, server T2TEST"), Some(false));
+        assert_eq!(super::login_verified("# aprsc 2.1.14-g5e22b37"), None);
     }
 
     #[test]

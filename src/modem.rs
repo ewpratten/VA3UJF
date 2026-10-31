@@ -33,6 +33,9 @@ const STATUS_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_WATCHDOG: Duration = Duration::from_secs(2);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
+// Five seconds of voice waiting on the modem
+const MAX_PENDING_FRAMES: usize = 250;
+
 struct ModemFrame {
     kind: u8,
     payload: Vec<u8>,
@@ -211,7 +214,7 @@ async fn connect(modem: &Modem, station: &Station, shared: &Shared) -> anyhow::R
         link.send(GET_VERSION, &[]).await?;
         match link.expect(GET_VERSION).await {
             Ok(frame) => {
-                link.protocol_version = frame.payload[0];
+                link.protocol_version = *frame.payload.first().context("modem sent an empty version reply")?;
                 let firmware: String = String::from_utf8_lossy(&frame.payload[1..]).chars().filter(|character| !character.is_control()).collect();
                 log::info!("Modem: {firmware}");
                 state::update(shared, |snapshot| snapshot.modem_firmware = firmware);
@@ -240,11 +243,48 @@ fn parse_status(protocol_version: u8, payload: &[u8]) -> Option<(bool, u8)> {
     Some((payload.get(flags_index)? & 0x01 == 0x01, *payload.get(3)?))
 }
 
+// Hand what the radio heard to the router without waiting on it, so the modem is always polled and fed
+fn pass_up(from_modem: &mpsc::Sender<Frame>, frame: Frame) -> anyhow::Result<()> {
+    match from_modem.try_send(frame) {
+        Err(mpsc::error::TrySendError::Closed(_)) => bail!("gateway side closed"),
+        Err(mpsc::error::TrySendError::Full(_)) => log::debug!("Router isn't keeping up, dropping a frame from the radio"),
+        Ok(()) => {}
+    }
+    Ok(())
+}
+
+// What a frame takes to send: the free slots the modem must report, the slots it then uses up, and the command carrying it
+fn transmit_command(frame: &Frame) -> (u8, u8, u8, Vec<u8>) {
+    match frame {
+        Frame::Header(header) => (5, 4, DSTAR_HEADER, header.with_crc().as_bytes().to_vec()),
+        Frame::Voice { ambe, slow_data, .. } => (2, 1, DSTAR_DATA, [&ambe[..], &slow_data[..]].concat()),
+        Frame::End => (2, 1, DSTAR_EOT, Vec::new()),
+    }
+}
+
+// Queue a frame for the modem. Only whole streams go out, so voice that arrives without its header is dropped
+fn queue_for_transmit(pending: &mut VecDeque<Frame>, in_stream: &mut bool, frame: Frame) {
+    match frame {
+        Frame::Header(_) => *in_stream = true,
+        _ if !*in_stream => return,
+        Frame::End => *in_stream = false,
+        Frame::Voice { .. } => {}
+    }
+    if pending.len() >= MAX_PENDING_FRAMES {
+        log::warn!("Modem isn't taking frames, dropping the stream it was sent");
+        pending.clear();
+        *in_stream = false;
+        return;
+    }
+    pending.push_back(frame);
+}
+
 async fn session(link: &mut Link, calibration: &Calibration, shared: &Shared, from_modem: &mpsc::Sender<Frame>, to_modem: &mut mpsc::Receiver<Frame>) -> anyhow::Result<()> {
     let mut status_timer = interval(STATUS_INTERVAL);
     let mut last_status = Instant::now();
     let mut free_slots = 0u8;
     let mut pending: VecDeque<Frame> = VecDeque::new();
+    let mut in_stream = false;
     loop {
         tokio::select! {
             _ = status_timer.tick() => {
@@ -253,7 +293,7 @@ async fn session(link: &mut Link, calibration: &Calibration, shared: &Shared, fr
                 }
                 link.send(GET_STATUS, &[]).await?;
             }
-            outgoing = to_modem.recv() => pending.push_back(outgoing.context("gateway side closed")?),
+            outgoing = to_modem.recv() => queue_for_transmit(&mut pending, &mut in_stream, outgoing.context("gateway side closed")?),
             frame = link.receive() => {
                 let frame = frame?;
                 match frame.kind {
@@ -265,17 +305,17 @@ async fn session(link: &mut Link, calibration: &Calibration, shared: &Shared, fr
                     }
                     DSTAR_HEADER => {
                         if let Ok((framed, _)) = HeaderWithCrc::read_from_prefix(&frame.payload) {
-                            from_modem.send(Frame::Header(framed.header)).await?;
+                            pass_up(from_modem, Frame::Header(framed.header))?;
                             report_signal(shared, calibration, signal_reading(&frame.payload, size_of::<HeaderWithCrc>()));
                         }
                     }
                     DSTAR_DATA if frame.payload.len() >= 12 => {
                         let ambe = frame.payload[..9].try_into()?;
                         let slow_data = frame.payload[9..12].try_into()?;
-                        from_modem.send(Frame::Voice { sequence: 0, ambe, slow_data }).await?;
+                        pass_up(from_modem, Frame::Voice { sequence: 0, ambe, slow_data })?;
                         report_signal(shared, calibration, signal_reading(&frame.payload, 12));
                     }
-                    DSTAR_LOST | DSTAR_EOT => from_modem.send(Frame::End).await?,
+                    DSTAR_LOST | DSTAR_EOT => pass_up(from_modem, Frame::End)?,
                     NAK => log::warn!("Modem NAKed command {:#04x}", frame.payload.first().copied().unwrap_or(0)),
                     _ => {}
                 }
@@ -284,16 +324,12 @@ async fn session(link: &mut Link, calibration: &Calibration, shared: &Shared, fr
 
         // Feed the modem's transmit buffer as space allows
         while let Some(next) = pending.front() {
-            let (needed, kind, payload) = match next {
-                Frame::Header(header) => (5, DSTAR_HEADER, header.with_crc().as_bytes().to_vec()),
-                Frame::Voice { ambe, slow_data, .. } => (2, DSTAR_DATA, [&ambe[..], &slow_data[..]].concat()),
-                Frame::End => (2, DSTAR_EOT, Vec::new()),
-            };
+            let (needed, used, kind, payload) = transmit_command(next);
             if free_slots < needed {
                 break;
             }
             link.send(kind, &payload).await?;
-            free_slots -= 1;
+            free_slots -= used;
             pending.pop_front();
         }
     }
@@ -313,7 +349,7 @@ pub async fn run(modem: Modem, station: Station, shared: Shared, from_modem: mps
     });
     let calibration = calibration.unwrap_or_default();
     loop {
-        match connect(&modem, &station, &shared).await {
+        match discard_while(&mut to_modem, connect(&modem, &station, &shared)).await {
             Ok(mut link) => {
                 log::info!("Modem ready on {}", modem.port);
                 state::update(&shared, |snapshot| snapshot.modem_connected = true);
@@ -324,7 +360,20 @@ pub async fn run(modem: Modem, station: Station, shared: Shared, from_modem: mps
             }
             Err(error) => log::error!("Couldn't start modem: {error:#}"),
         }
-        sleep(RECONNECT_DELAY).await;
+        discard_while(&mut to_modem, sleep(RECONNECT_DELAY)).await;
+    }
+}
+
+// Throw away what the router sends while there's no modem to take it, so nothing stale goes out once there is
+async fn discard_while<T>(to_modem: &mut mpsc::Receiver<Frame>, work: impl Future<Output = T>) -> T {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            frame = to_modem.recv() => if frame.is_none() {
+                return work.await;
+            },
+        }
     }
 }
 
@@ -357,6 +406,51 @@ mod tests {
     fn readings_are_only_there_when_the_modem_sends_them() {
         assert_eq!(signal_reading(&[0; 12], 12), None);
         assert_eq!(signal_reading(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x5B], 12), Some(0x045B));
+    }
+
+    fn voice() -> Frame {
+        Frame::Voice { sequence: 0, ambe: [1; 9], slow_data: [2; 3] }
+    }
+
+    fn header() -> Frame {
+        Frame::Header(crate::dstar::Header { flags: [0; 3], repeater_2: [b' '; 8], repeater_1: [b' '; 8], your_call: [b' '; 8], my_call: [b' '; 8], my_suffix: [b' '; 4] })
+    }
+
+    #[test]
+    fn a_header_uses_four_slots_of_the_modems_buffer() {
+        let slots = |frame: Frame| {
+            let (needed, used, _, _) = transmit_command(&frame);
+            (needed, used)
+        };
+        assert_eq!((slots(header()), slots(voice()), slots(Frame::End)), ((5, 4), (2, 1), (2, 1)));
+    }
+
+    #[test]
+    fn only_whole_streams_are_queued_and_the_queue_is_bounded() {
+        let (mut pending, mut in_stream) = (VecDeque::new(), false);
+        for frame in [voice(), Frame::End, header(), voice(), Frame::End, voice()] {
+            queue_for_transmit(&mut pending, &mut in_stream, frame);
+        }
+        assert_eq!(pending, [header(), voice(), Frame::End]);
+
+        queue_for_transmit(&mut pending, &mut in_stream, header());
+        for _ in 0..MAX_PENDING_FRAMES {
+            queue_for_transmit(&mut pending, &mut in_stream, voice());
+        }
+        assert!(pending.is_empty() && !in_stream);
+    }
+
+    #[tokio::test]
+    async fn frames_sent_while_the_modem_is_away_are_discarded() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let filler = tokio::spawn(async move {
+            for _ in 0..20 {
+                sender.send(voice()).await.unwrap();
+            }
+        });
+        discard_while(&mut receiver, sleep(Duration::from_millis(100))).await;
+        filler.await.unwrap();
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

@@ -7,17 +7,19 @@ use crate::dstar::{build_slow_data_blocks, pad, Frame, Header, FRAMES_PER_SUPERF
 use crate::router::Port;
 use crate::state::{self, Shared};
 use anyhow::Context;
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Instant};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, timeout, Instant};
 
-// Stream housekeeping
+// Stream housekeeping. The router ends a quiet D-STAR stream itself, so the bridge's own timeout is only a backstop
 const VOCODER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-const DSTAR_STREAM_TIMEOUT: Duration = Duration::from_secs(1);
+const VOCODER_SILENCE_TIMEOUT: Duration = Duration::from_secs(2);
+const DSTAR_STREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const AUDIO_STREAM_TIMEOUT: Duration = Duration::from_millis(300);
 const ENCODER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const DECODER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct Settings {
     // How the bridge is named in the log and the status page
@@ -37,9 +39,12 @@ struct Bridge {
     to_router: mpsc::Sender<Frame>,
     shared: Shared,
     to_audio: mpsc::Sender<Audio>,
-    vocoder_address: SocketAddr,
     vocoder: Option<Vocoder>,
     vocoder_last_attempt: Instant,
+    vocoder_connecting: Option<JoinHandle<anyhow::Result<Vocoder>>>,
+
+    // When the oldest request the vocoder hasn't answered was sent
+    vocoder_waiting_since: Option<Instant>,
     slow_data_blocks: Vec<[u8; 3]>,
     receive_gain: f32,
     transmit_gain: f32,
@@ -47,6 +52,8 @@ struct Bridge {
     // D-STAR -> audio stream state
     inbound_active: bool,
     inbound_last_heard: Instant,
+    inbound_ending_since: Option<Instant>,
+    inbound_pending_decodes: u32,
     warned_no_vocoder_inbound: bool,
 
     // Audio -> D-STAR stream state
@@ -62,8 +69,22 @@ impl Bridge {
     fn lose_vocoder(&mut self, error: std::io::Error) {
         log::warn!("Vocoder lost: {error}");
         self.vocoder = None;
+        self.vocoder_waiting_since = None;
         state::update(&self.shared, |snapshot| state::set_vocoder(snapshot, self.settings.name, false));
         self.outbound_pending_encodes = 0;
+        self.inbound_pending_decodes = 0;
+    }
+
+    // Note a request sent to the vocoder, which is expected to be answered
+    fn vocoder_asked(&mut self) {
+        self.vocoder_waiting_since.get_or_insert_with(Instant::now);
+    }
+
+    // A reply lost once a stream is over isn't worth reconnecting for
+    fn forget_unanswered_requests(&mut self) {
+        if self.inbound_pending_decodes == 0 && self.outbound_pending_encodes == 0 {
+            self.vocoder_waiting_since = None;
+        }
     }
 
     async fn send_audio(&mut self, audio: Audio) {
@@ -75,11 +96,19 @@ impl Bridge {
     async fn handle_router_frame(&mut self, frame: Frame) {
         match frame {
             Frame::Header(header) => {
+                if self.inbound_active {
+                    self.finish_inbound().await;
+                }
                 log::info!("D-STAR -> {}: {}", self.settings.name, header.my_call_text());
                 self.inbound_active = true;
                 self.inbound_last_heard = Instant::now();
             }
-            Frame::Voice { ambe, .. } if self.inbound_active => {
+            Frame::Voice { ambe, .. } if self.inbound_ending_since.is_none() => {
+                // Voice whose header went astray is still the transmission that holds the channel
+                if !self.inbound_active {
+                    log::info!("D-STAR -> {}: picking up a transmission partway through", self.settings.name);
+                    self.inbound_active = true;
+                }
                 self.inbound_last_heard = Instant::now();
                 let Some(vocoder) = self.vocoder.as_mut() else {
                     if !self.warned_no_vocoder_inbound {
@@ -88,8 +117,12 @@ impl Bridge {
                     }
                     return;
                 };
-                if let Err(error) = vocoder.decode(&ambe).await {
-                    self.lose_vocoder(error);
+                match vocoder.decode(&ambe).await {
+                    Ok(()) => {
+                        self.inbound_pending_decodes += 1;
+                        self.vocoder_asked();
+                    }
+                    Err(error) => self.lose_vocoder(error),
                 }
             }
             Frame::End if self.inbound_active => self.end_inbound().await,
@@ -97,9 +130,20 @@ impl Bridge {
         }
     }
 
+    // The transmission is over once the vocoder has handed back everything it was given to decode
     async fn end_inbound(&mut self) {
+        self.inbound_ending_since.get_or_insert_with(Instant::now);
+        if self.inbound_pending_decodes == 0 {
+            self.finish_inbound().await;
+        }
+    }
+
+    async fn finish_inbound(&mut self) {
         log::info!("D-STAR -> {}: end of transmission", self.settings.name);
         self.inbound_active = false;
+        self.inbound_ending_since = None;
+        self.inbound_pending_decodes = 0;
+        self.forget_unanswered_requests();
         self.warned_no_vocoder_inbound = false;
         self.send_audio(Audio::End).await;
     }
@@ -147,7 +191,10 @@ impl Bridge {
         // Hand the audio to the encoder, which answers asynchronously
         let samples = apply_gain(samples.into_iter(), self.transmit_gain);
         match self.vocoder.as_mut().unwrap().encode(&samples).await {
-            Ok(()) => self.outbound_pending_encodes += 1,
+            Ok(()) => {
+                self.outbound_pending_encodes += 1;
+                self.vocoder_asked();
+            }
             Err(error) => self.lose_vocoder(error),
         }
     }
@@ -155,10 +202,17 @@ impl Bridge {
     async fn handle_vocoder(&mut self, decoded: Vec<Decoded>) {
         for item in decoded {
             match item {
-                // Decoded speech heads out as audio
+                // Decoded speech heads out as audio, unless its transmission has already been closed out
                 Decoded::Speech(samples) => {
+                    if !self.inbound_active {
+                        continue;
+                    }
+                    self.inbound_pending_decodes = self.inbound_pending_decodes.saturating_sub(1);
                     let samples = apply_gain(samples.into_iter(), self.receive_gain);
                     self.send_audio(Audio::Voice(samples)).await;
+                    if self.inbound_ending_since.is_some() && self.inbound_pending_decodes == 0 {
+                        self.finish_inbound().await;
+                    }
                 }
 
                 // Encoded AMBE heads to D-STAR
@@ -172,6 +226,10 @@ impl Bridge {
                 }
             }
         }
+
+        // Anything the vocoder says means it's still there
+        let still_waiting = self.inbound_pending_decodes > 0 || self.outbound_pending_encodes > 0;
+        self.vocoder_waiting_since = still_waiting.then(Instant::now);
     }
 
     // ---- Timers ----
@@ -179,16 +237,24 @@ impl Bridge {
     async fn housekeeping(&mut self) {
         let now = Instant::now();
 
-        // Keep trying to reach the vocoder
-        if self.vocoder.is_none() && now.duration_since(self.vocoder_last_attempt) > VOCODER_RETRY_INTERVAL {
+        // Keep trying to reach the vocoder, without holding up the streams while it's slow to answer
+        if self.vocoder.is_none() && self.vocoder_connecting.is_none() && now.duration_since(self.vocoder_last_attempt) > VOCODER_RETRY_INTERVAL {
             self.vocoder_last_attempt = now;
-            match Vocoder::connect(self.vocoder_address).await {
+            self.vocoder_connecting = Some(tokio::spawn(connect_vocoder(self.settings.ambeserver.clone())));
+        }
+        if let Some(connecting) = self.vocoder_connecting.take_if(|connecting| connecting.is_finished()) {
+            match connecting.await.map_err(anyhow::Error::from).and_then(|connected| connected) {
                 Ok(vocoder) => {
                     self.vocoder = Some(vocoder);
                     state::update(&self.shared, |snapshot| state::set_vocoder(snapshot, self.settings.name, true));
                 }
-                Err(error) => log::warn!("Could not initialize vocoder at {}: {error:#}", self.vocoder_address),
+                Err(error) => log::warn!("Could not initialize vocoder at {}: {error:#}", self.settings.ambeserver),
             }
+        }
+
+        // A vocoder that stops answering is as good as gone
+        if self.vocoder_waiting_since.is_some_and(|since| now.duration_since(since) > VOCODER_SILENCE_TIMEOUT) {
+            self.lose_vocoder(std::io::Error::new(std::io::ErrorKind::TimedOut, "it stopped answering"));
         }
 
         // Keep the vocoder session alive between transmissions
@@ -199,9 +265,14 @@ impl Bridge {
             self.lose_vocoder(error);
         }
 
-        // Close out a D-STAR stream that lost its terminator
-        if self.inbound_active && now.duration_since(self.inbound_last_heard) > DSTAR_STREAM_TIMEOUT {
+        // Close out a D-STAR stream that lost its terminator, or whose last decodes never came back
+        if self.inbound_active && self.inbound_ending_since.is_none() && now.duration_since(self.inbound_last_heard) > DSTAR_STREAM_TIMEOUT {
             self.end_inbound().await;
+        }
+        if let Some(since) = self.inbound_ending_since
+            && (self.inbound_pending_decodes == 0 || now.duration_since(since) > DECODER_DRAIN_TIMEOUT)
+        {
+            self.finish_inbound().await;
         }
 
         // Close out an audio stream once it stops and the encoder has drained
@@ -215,6 +286,8 @@ impl Bridge {
                 log::info!("{} -> D-STAR: end of transmission", self.settings.name);
                 self.outbound_active = false;
                 self.outbound_ending_since = None;
+                self.outbound_pending_encodes = 0;
+                self.forget_unanswered_requests();
                 self.warned_no_vocoder_outbound = false;
                 let _ = self.to_router.send(Frame::End).await;
             }
@@ -222,9 +295,14 @@ impl Bridge {
     }
 }
 
+// Look up the AMBEserver each time, so one that's not resolvable yet, or has moved, is found once it is
+async fn connect_vocoder(ambeserver: String) -> anyhow::Result<Vocoder> {
+    let address = timeout(VOCODER_RETRY_INTERVAL, lookup_host(ambeserver.as_str())).await.context("looking up the AMBEserver timed out")??.next().context("couldn't resolve the AMBEserver address")?;
+    Vocoder::connect(address).await
+}
+
 // Run the bridge, taking D-STAR frames from the router and handing back audio, and turning audio it's given into D-STAR frames
 pub async fn run(settings: Settings, station: Station, shared: Shared, port: Port, mut from_audio: mpsc::Receiver<Audio>, to_audio: mpsc::Sender<Audio>) -> anyhow::Result<()> {
-    let vocoder_address = lookup_host(settings.ambeserver.as_str()).await?.next().context("couldn't resolve the AMBEserver address")?;
     let Port { to_router, mut from_router } = port;
 
     let now = Instant::now();
@@ -237,11 +315,14 @@ pub async fn run(settings: Settings, station: Station, shared: Shared, port: Por
         to_router,
         shared,
         to_audio,
-        vocoder_address,
         vocoder: None,
         vocoder_last_attempt: now - VOCODER_RETRY_INTERVAL,
+        vocoder_connecting: None,
+        vocoder_waiting_since: None,
         inbound_active: false,
         inbound_last_heard: now,
+        inbound_ending_since: None,
+        inbound_pending_decodes: 0,
         warned_no_vocoder_inbound: false,
         outbound_active: false,
         outbound_sequence: 0,
@@ -282,6 +363,7 @@ pub async fn run(settings: Settings, station: Station, shared: Shared, port: Por
 mod tests {
     use super::*;
     use crate::codec::ambe::fake_server;
+    use std::net::SocketAddr;
 
     fn station() -> Station {
         toml::from_str("callsign = \"N0CALL\"\nmodule = \"B\"\nfrequency_mhz = 446.5\nlatitude = 45.0\nlongitude = -90.0").unwrap()
@@ -354,5 +436,55 @@ mod tests {
             }
         }
         assert_eq!(voice, 1);
+    }
+
+    // Everything heard until the end of the transmission, which has to come last
+    async fn audio_until_end(audio_out: &mut mpsc::Receiver<Audio>) -> usize {
+        let mut voice = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), audio_out.recv()).await {
+                Ok(Some(Audio::Voice(_))) => voice += 1,
+                Ok(Some(Audio::End)) => break,
+                other => panic!("the transmission never ended: {other:?}"),
+            }
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(300), audio_out.recv()).await.is_err(), "audio came after the end of the transmission");
+        voice
+    }
+
+    #[tokio::test]
+    async fn every_frame_is_heard_before_the_end_even_when_the_end_follows_right_behind() {
+        let (_shared, to_bridge, _from_bridge, _audio_in, mut audio_out) = start().await;
+        let header = Header { flags: [0; 3], repeater_2: pad("N0CALL G"), repeater_1: pad("N0CALL B"), your_call: pad("CQCQCQ"), my_call: pad("N0TEST"), my_suffix: pad("") };
+        to_bridge.send(Frame::Header(header)).await.unwrap();
+        for _ in 0..20 {
+            to_bridge.send(Frame::Voice { sequence: 0, ambe: [1; 9], slow_data: [0; 3] }).await.unwrap();
+        }
+        to_bridge.send(Frame::End).await.unwrap();
+        assert_eq!(audio_until_end(&mut audio_out).await, 20);
+    }
+
+    #[tokio::test]
+    async fn voice_whose_header_went_missing_is_still_heard() {
+        let (_shared, to_bridge, _from_bridge, _audio_in, mut audio_out) = start().await;
+        to_bridge.send(Frame::Voice { sequence: 0, ambe: [1; 9], slow_data: [0; 3] }).await.unwrap();
+        to_bridge.send(Frame::End).await.unwrap();
+        assert_eq!(audio_until_end(&mut audio_out).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_vocoder_that_cannot_be_found_yet_does_not_stop_the_bridge() {
+        let (to_bridge, from_router) = mpsc::channel(256);
+        let (to_router, _from_bridge) = mpsc::channel(256);
+        let (_audio_in, from_audio) = mpsc::channel(256);
+        let (to_audio, _audio_out) = mpsc::channel(256);
+        let settings = Settings { ambeserver: "ambeserver.invalid:2460".into(), ..settings(fake_server().await) };
+        let bridge = tokio::spawn(run(settings, station(), Shared::default(), Port { to_router, from_router }, from_audio, to_audio));
+
+        // It keeps taking what the router sends, well past what its queue holds
+        for _ in 0..600 {
+            tokio::time::timeout(Duration::from_secs(1), to_bridge.send(Frame::Voice { sequence: 0, ambe: [1; 9], slow_data: [0; 3] })).await.expect("the bridge stopped listening").unwrap();
+        }
+        assert!(!bridge.is_finished());
     }
 }

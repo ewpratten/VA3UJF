@@ -12,6 +12,7 @@ const BLOCK_TYPE_SQUELCH: u8 = 0xC0;
 const BLOCK_TYPE_FAST_DATA: u8 = 0x80;
 const TEXT_LENGTH: usize = 20;
 const TEXT_BLOCK_LENGTH: usize = 5;
+const BLOCK_PAYLOAD_LENGTH: usize = 5;
 
 #[derive(Debug, PartialEq)]
 pub enum Decoded {
@@ -57,7 +58,7 @@ impl Decoder {
         };
         let block = [&first_half[..], &descrambled[..]].concat();
         match block[0] & BLOCK_TYPE_MASK {
-            BLOCK_TYPE_GPS => self.sentences.push(&block[1..]).map(Decoded::Gps),
+            BLOCK_TYPE_GPS => self.sentences.push(&block[1..1 + (block[0] as usize & 0x0F).min(BLOCK_PAYLOAD_LENGTH)]).map(Decoded::Gps),
             BLOCK_TYPE_TEXT => self.push_text(&block),
             BLOCK_TYPE_SQUELCH => None,
             BLOCK_TYPE_HEADER => Some(Decoded::Other { kind: "header", bytes: block[1..].to_vec() }),
