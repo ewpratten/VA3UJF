@@ -12,6 +12,7 @@ mod hosts;
 mod integration;
 mod http;
 mod live;
+mod m17;
 mod meter;
 mod metrics;
 mod modem;
@@ -73,6 +74,8 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
     let allstar_handle = config.allstar.clone().map(|allstar| allstar::start(allstar, config.station.clone(), shared.clone(), &mut router, speaker.clone()));
     let echolink_handle = config.echolink.clone().map(|echolink| echolink::start(echolink, config.station.clone(), shared.clone(), &mut router, speaker.clone()));
 
+    let m17_handle = config.m17.clone().map(|m17| m17::start(m17, config.station.clone(), shared.clone(), &mut router, speaker.clone()));
+
     // Operators who call the station's own callsign over RF can manage the links in plain language
     let command_tap = config.voice_control.clone().and_then(|voice_control| {
         let ambeserver = voice_control.ambeserver.clone().or_else(|| config.speech.as_ref().and_then(|speech| speech.ambeserver.clone())).or_else(|| config.allstar.as_ref().map(|allstar| allstar.ambeserver.clone())).or_else(|| config.echolink.as_ref().map(|echolink| echolink.ambeserver.clone()))?;
@@ -93,7 +96,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
     let http_config = config.clone();
     let http_shared = shared.clone();
     tokio::spawn(async move {
-        if let Err(error) = http::serve(http_config, directory, http_shared, command_sender, allstar_handle, echolink_handle, metrics).await {
+        if let Err(error) = http::serve(http_config, directory, http_shared, command_sender, allstar_handle, echolink_handle, m17_handle, metrics).await {
             log::error!("Web UI failed: {error:#}");
         }
     });

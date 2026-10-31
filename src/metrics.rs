@@ -10,7 +10,7 @@ use tokio::sync::broadcast::error::RecvError;
 const NO_LABELS: [&str; 0] = [];
 
 // Where the sources of voice are named in the metrics, so each has a count from the first scrape
-const SOURCES: [&str; 4] = ["rf", "reflector", "allstar", "echolink"];
+const SOURCES: [&str; 5] = ["rf", "reflector", "allstar", "echolink", "m17"];
 
 // Bit error rates worth telling apart, as percentages
 const BER_BUCKETS: [f64; 8] = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0];

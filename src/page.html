@@ -118,7 +118,7 @@
 </main>
 <script>
   const STATION = { latitude: {{latitude}}, longitude: {{longitude}}, callsign: "{{callsign}}" };
-  const SOURCES = { rf: "RF", reflector: "Reflector", allstar: "AllStar node", echolink: "EchoLink station", announcement: "Announcement", ack: "Repeater" };
+  const SOURCES = { rf: "RF", reflector: "Reflector", allstar: "AllStar node", echolink: "EchoLink station", m17: "M17 reflector", announcement: "Announcement", ack: "Repeater" };
   
   const sourceName = (source) => SOURCES[source] ?? source;
   const text = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
@@ -148,7 +148,7 @@
   const levels = new Map();
 
   // Peers reached through a link that reports on them, rather than stations heard directly
-  const LINKED_VIA = { allstar: "AllStar", echolink: "EchoLink" };
+  const LINKED_VIA = { allstar: "AllStar", echolink: "EchoLink", m17: "M17" };
   const levelKey = (peer) => peer.via in LINKED_VIA ? `source:${peer.via}` : `call:${peer.callsign}`;
 
   function levelFill(key) {
@@ -262,7 +262,7 @@
   // ---- Traffic ----
 
   const FLOW_WINDOW_SECONDS = 300;
-  const FLOW_SOURCES = ["rf", "reflector", "allstar", "echolink"];
+  const FLOW_SOURCES = ["rf", "reflector", "allstar", "echolink", "m17"];
   const FLOW_STATIONS_SHOWN = 10;
   const FLOW = { width: 900, height: 300, padding: 22, nodeWidth: 12, leftX: 170, middleX: 444, rightX: 718, minNode: 16, gap: 10, floorUnits: 10 };
   let history = [];

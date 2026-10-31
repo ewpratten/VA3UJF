@@ -77,6 +77,14 @@ actions = [{ unlink = "54321" }]
 # [echolink.stations]
 # "W1AW-R" = "192.0.2.30:5198"
 
+# An M17 client of one reflector at a time. M17 carries Codec 2 voice, so it's vocoded to and from D-STAR through an AMBEserver. Reflectors are named
+# here, each at "host" or "host:port" with the port defaulting to 17000, and startup_reflector is written as "NAME M"
+# [m17]
+# ambeserver = "127.0.0.1:2460"
+# startup_reflector = "M17-XXX C"
+# [m17.reflectors]
+# "M17-XXX" = "192.0.2.40"
+
 # Operators manage the node by calling the station's own callsign over RF, in plain language, like "link to AllStar node 5 4 3 2 1". What they say is
 # transcribed here, and a language model reached through a Cloudflare AI Gateway carries it out with tools that link, unlink and report on the links.
 # The reply is spoken, so [speech] is needed. Only the listed callsigns are obeyed, and D-STAR doesn't authenticate callsigns, so treat this as a convenience
